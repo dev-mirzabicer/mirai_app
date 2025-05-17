@@ -3,20 +3,18 @@
 import json
 import uuid
 import re
-from datetime import datetime, timezone, timedelta
-from pathlib import Path
-from typing import Any, Optional, List
 import logging
+from datetime import datetime, timezone, timedelta, date  # Added date here
+from pathlib import Path
+from typing import Any, Optional, List, Union  # Added Union and date
 
 import pytz
 from dateutil import parser as dateutil_parser
+from dateutil.parser import isoparse  # For strict ISO date parsing
 
 from mirai_app import config  # Import our config
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
 
 # --- Date & Time Utilities ---
 
@@ -32,41 +30,102 @@ def get_current_datetime_local() -> datetime:
     return datetime.now(local_tz)
 
 
-def format_datetime_iso(dt_obj: datetime) -> str:
-    """Formats a datetime object to ISO 8601 string (UTC if naive)."""
-    if dt_obj.tzinfo is None:  # Assume UTC if naive
-        dt_obj = dt_obj.replace(tzinfo=timezone.utc)
+def format_datetime_iso(dt_obj: Union[datetime, date]) -> str:  # Accepts date too
+    """Formats a datetime or date object to ISO 8601 string (UTC if naive datetime)."""
+    if isinstance(dt_obj, datetime):
+        if dt_obj.tzinfo is None:  # Assume UTC if naive
+            dt_obj = dt_obj.replace(tzinfo=timezone.utc)
+    # For date objects, isoformat() is YYYY-MM-DD, which is fine.
     return dt_obj.isoformat()
 
 
-def format_datetime_for_llm(dt_obj: datetime) -> str:
-    """Formats a datetime object into a human-readable string for the LLM, including timezone name."""
-    if dt_obj.tzinfo is None or dt_obj.tzinfo.utcoffset(dt_obj) is None:
-        local_tz = pytz.timezone(config.MIRZA_TIMEZONE)
-        dt_obj = (
-            local_tz.localize(dt_obj)
-            if dt_obj.tzinfo is None
-            else dt_obj.astimezone(local_tz)
-        )
-    return dt_obj.strftime("%Y-%m-%d %H:%M:%S %Z")  # e.g., 2025-05-17 19:09:51 EEST
+def format_datetime_for_llm(dt_obj: Union[datetime, date]) -> str:  # Accepts date too
+    """
+    Formats a datetime or date object into a human-readable string for the LLM.
+    For datetimes, includes timezone name. For dates, just YYYY-MM-DD.
+    """
+    if isinstance(dt_obj, datetime):
+        if dt_obj.tzinfo is None or dt_obj.tzinfo.utcoffset(dt_obj) is None:
+            local_tz = pytz.timezone(config.MIRZA_TIMEZONE)
+            dt_obj = (
+                local_tz.localize(dt_obj)
+                if dt_obj.tzinfo is None
+                else dt_obj.astimezone(local_tz)
+            )
+        return dt_obj.strftime("%Y-%m-%d %H:%M:%S %Z")  # e.g., 2025-05-17 19:09:51 EEST
+    elif isinstance(dt_obj, date):
+        return dt_obj.strftime("%Y-%m-%d")
+    return str(dt_obj)  # Fallback
 
 
 def parse_datetime_flexible(
     datetime_str: str, tz_aware: bool = True
-) -> Optional[datetime]:
+) -> Optional[Union[datetime, date]]:
     """
     Parses a datetime string using dateutil.parser.
-    If tz_aware is True and the parsed datetime is naive, it localizes to MIRZA_TIMEZONE.
+    If the string represents only a date (e.g., "YYYY-MM-DD" or "May 20, 2024"),
+    it attempts to return a datetime.date object.
+    Otherwise, it returns a datetime.datetime object.
+    If tz_aware is True and the parsed result is a datetime.datetime object and naive,
+    it localizes to MIRZA_TIMEZONE.
     """
     if not datetime_str:
         return None
     try:
-        dt_obj = dateutil_parser.parse(datetime_str)
-        if tz_aware and dt_obj.tzinfo is None:
-            local_tz = pytz.timezone(config.MIRZA_TIMEZONE)
-            dt_obj = local_tz.localize(dt_obj)
-        return dt_obj
-    except (ValueError, TypeError, OverflowError):
+        # Attempt to parse as a strict ISO date first
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", datetime_str):
+            try:
+                # isoparse will raise ValueError if not a valid ISO date string
+                # .date() directly gives datetime.date
+                return isoparse(datetime_str).date()
+            except ValueError:
+                # If isoparse fails (e.g. "2023-13-01"), let general parser try or fail
+                pass
+
+        # General parsing using dateutil
+        dt_obj_parsed = dateutil_parser.parse(datetime_str)
+
+        if isinstance(dt_obj_parsed, datetime):
+            # Heuristic: if the parsed datetime is midnight AND the original string
+            # doesn't contain explicit time indicators, treat it as a date.
+            if dt_obj_parsed.time() == datetime.min.time():
+                has_time_indicators = any(
+                    indicator in datetime_str.upper()
+                    for indicator in [
+                        ":",
+                        "AM",
+                        "PM",
+                        "H",
+                        "T",
+                    ]  # 'T' for ISO8601 T separator
+                )
+                # Also check for numeric time patterns like HHMMSS or HHMM
+                has_numeric_time = re.search(
+                    r"\b\d{4,6}\b", datetime_str
+                ) and not re.fullmatch(
+                    r"\d{4}", datetime_str
+                )  # Avoid matching year as time
+
+                if not has_time_indicators and not has_numeric_time:
+                    return dt_obj_parsed.date()  # Convert to pure date
+
+            # It's a datetime object, ensure timezone awareness if requested
+            if tz_aware and dt_obj_parsed.tzinfo is None:
+                local_tz = pytz.timezone(config.MIRZA_TIMEZONE)
+                dt_obj_parsed = local_tz.localize(dt_obj_parsed)
+            return dt_obj_parsed
+        elif isinstance(
+            dt_obj_parsed, date
+        ):  # Should be rare from dateutil_parser.parse directly
+            return dt_obj_parsed
+
+        # Fallback if somehow not datetime or date (shouldn't happen with dateutil)
+        return dt_obj_parsed
+
+    except (ValueError, TypeError, OverflowError) as e:
+        logger.warning(
+            f"Failed to parse datetime string '{datetime_str}': {type(e).__name__} - {e}"
+        )
         return None
 
 
@@ -74,22 +133,45 @@ def _parse_duration_string(duration_str: str) -> Optional[tuple[int, str]]:
     """Helper to parse duration string into value and unit type."""
     if not duration_str:
         return None
-    # Regex to capture value and unit. Ensure 'mon' is before 'm' if 'm' is for month.
-    # If 'm' is for minutes, ensure it's distinct.
-    # Let's make 'm' explicitly for minutes, 'mon' for months.
+    # Regex to capture value and unit.
     match = re.match(
-        r"(\d+)\s*(days?|weeks?|months?|hours?|minutes?|d|w|mon|h|m)",  # Added 'm' as a direct alternative
+        r"(\d+)\s*(days?|weeks?|months?|hours?|minutes?|d|w|mon|h|m)",
         duration_str,
         re.IGNORECASE,
     )
     if not match:
+        # Try ISO 8601 duration format like P1D, PT1H (simplified)
+        iso_match = re.match(
+            r"P(?:(\d+)Y)?(?:(\d+)M)?(?:(\d+)W)?(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?",
+            duration_str.upper(),
+        )
+        if iso_match:
+            years, months, weeks, days, hours, minutes, seconds = [
+                int(g) if g else 0 for g in iso_match.groups()
+            ]
+            if years > 0:
+                return years * 12, "months"  # Approximate years to months
+            if months > 0:
+                return months, "months"
+            if weeks > 0:
+                return weeks, "weeks"
+            if days > 0:
+                return days, "days"
+            if hours > 0:
+                return hours, "hours"
+            if minutes > 0:
+                return minutes, "minutes"
+            # Seconds duration not directly used for event.add('duration', timedelta) in this simplified parser
+            logger.warning(
+                f"Seconds from ISO duration '{duration_str}' not directly converted by _parse_duration_string."
+            )
+            return None  # Or handle seconds if needed by returning timedelta directly
         return None
 
     value = int(match.group(1))
     unit_str_matched = match.group(2).lower()
 
-    # Normalize unit
-    if unit_str_matched in ["minute", "minutes", "min", "m"]:  # Added "m" here
+    if unit_str_matched in ["minute", "minutes", "min", "m"]:
         unit_type = "minutes"
     elif unit_str_matched in ["hour", "hours", "h"]:
         unit_type = "hours"
@@ -100,12 +182,10 @@ def _parse_duration_string(duration_str: str) -> Optional[tuple[int, str]]:
     elif unit_str_matched in ["month", "months", "mon"]:
         unit_type = "months"
     else:
-        # This case should ideally not be reached if regex is comprehensive
         logger.warning(
             f"Unmatched unit string after regex: '{unit_str_matched}' from '{duration_str}'"
         )
         return None
-
     return value, unit_type
 
 
@@ -282,6 +362,13 @@ def get_mirza_location() -> str:
 
 
 if __name__ == "__main__":
+
+    # Configure logger here
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
+
     print("--- Testing Date/Time Utilities ---")
     now_utc = get_current_datetime_utc()
     now_local = get_current_datetime_local()
