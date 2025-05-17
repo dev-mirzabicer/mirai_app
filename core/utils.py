@@ -3,18 +3,25 @@
 import json
 import uuid
 import re
-import logging
-from datetime import datetime, timezone, timedelta, date  # Added date here
+from datetime import datetime, timezone, timedelta, date
 from pathlib import Path
-from typing import Any, Optional, List, Union  # Added Union and date
+from typing import Any, Optional, List, Union
 
 import pytz
 from dateutil import parser as dateutil_parser
-from dateutil.parser import isoparse  # For strict ISO date parsing
+from dateutil.parser import isoparse
 
-from mirai_app import config  # Import our config
+import logging
+
+from mirai_app import config
 
 logger = logging.getLogger(__name__)
+# Ensure logging is configured by the main app or if run standalone
+if not logger.hasHandlers():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
 
 # --- Date & Time Utilities ---
 
@@ -26,100 +33,100 @@ def get_current_datetime_utc() -> datetime:
 
 def get_current_datetime_local() -> datetime:
     """Returns the current datetime in Mirza's local timezone."""
-    local_tz = pytz.timezone(config.MIRZA_TIMEZONE)
-    return datetime.now(local_tz)
+    try:
+        local_tz = pytz.timezone(config.MIRZA_TIMEZONE)
+        return datetime.now(local_tz)
+    except pytz.UnknownTimeZoneError:
+        logger.error(
+            f"MIRZA_TIMEZONE '{config.MIRZA_TIMEZONE}' is unknown. Falling back to UTC."
+        )
+        return datetime.now(timezone.utc)
 
 
-def format_datetime_iso(dt_obj: Union[datetime, date]) -> str:  # Accepts date too
+def format_datetime_iso(dt_obj: Union[datetime, date]) -> str:
     """Formats a datetime or date object to ISO 8601 string (UTC if naive datetime)."""
     if isinstance(dt_obj, datetime):
-        if dt_obj.tzinfo is None:  # Assume UTC if naive
+        if dt_obj.tzinfo is None:
             dt_obj = dt_obj.replace(tzinfo=timezone.utc)
-    # For date objects, isoformat() is YYYY-MM-DD, which is fine.
     return dt_obj.isoformat()
 
 
-def format_datetime_for_llm(dt_obj: Union[datetime, date]) -> str:  # Accepts date too
+def format_datetime_for_llm(dt_obj: Union[datetime, date]) -> str:
     """
     Formats a datetime or date object into a human-readable string for the LLM.
     For datetimes, includes timezone name. For dates, just YYYY-MM-DD.
     """
     if isinstance(dt_obj, datetime):
         if dt_obj.tzinfo is None or dt_obj.tzinfo.utcoffset(dt_obj) is None:
-            local_tz = pytz.timezone(config.MIRZA_TIMEZONE)
-            dt_obj = (
-                local_tz.localize(dt_obj)
-                if dt_obj.tzinfo is None
-                else dt_obj.astimezone(local_tz)
-            )
-        return dt_obj.strftime("%Y-%m-%d %H:%M:%S %Z")  # e.g., 2025-05-17 19:09:51 EEST
+            try:
+                local_tz = pytz.timezone(config.MIRZA_TIMEZONE)
+                dt_obj = (
+                    local_tz.localize(dt_obj)
+                    if dt_obj.tzinfo is None
+                    else dt_obj.astimezone(local_tz)
+                )
+            except pytz.UnknownTimeZoneError:
+                logger.warning(
+                    f"MIRZA_TIMEZONE '{config.MIRZA_TIMEZONE}' unknown in format_datetime_for_llm. Using naive or original TZ."
+                )
+        return dt_obj.strftime("%Y-%m-%d %H:%M:%S %Z")
     elif isinstance(dt_obj, date):
         return dt_obj.strftime("%Y-%m-%d")
-    return str(dt_obj)  # Fallback
+    return str(dt_obj)
 
 
 def parse_datetime_flexible(
-    datetime_str: str, tz_aware: bool = True
+    datetime_str: str,
+    tz_aware: bool = True,
+    default_localize_tz_str: Optional[str] = None,  # <-- New parameter
 ) -> Optional[Union[datetime, date]]:
     """
-    Parses a datetime string using dateutil.parser.
-    If the string represents only a date (e.g., "YYYY-MM-DD" or "May 20, 2024"),
-    it attempts to return a datetime.date object.
-    Otherwise, it returns a datetime.datetime object.
-    If tz_aware is True and the parsed result is a datetime.datetime object and naive,
-    it localizes to MIRZA_TIMEZONE.
+    Parses a datetime string.
+    If the string represents only a date, it attempts to return a datetime.date object.
+    If tz_aware is True and the parsed result is a naive datetime.datetime object:
+      - It localizes using default_localize_tz_str if provided.
+      - Otherwise, it localizes to config.MIRZA_TIMEZONE.
     """
     if not datetime_str:
         return None
     try:
-        # Attempt to parse as a strict ISO date first
         if re.fullmatch(r"\d{4}-\d{2}-\d{2}", datetime_str):
             try:
-                # isoparse will raise ValueError if not a valid ISO date string
-                # .date() directly gives datetime.date
                 return isoparse(datetime_str).date()
             except ValueError:
-                # If isoparse fails (e.g. "2023-13-01"), let general parser try or fail
                 pass
 
-        # General parsing using dateutil
         dt_obj_parsed = dateutil_parser.parse(datetime_str)
 
         if isinstance(dt_obj_parsed, datetime):
-            # Heuristic: if the parsed datetime is midnight AND the original string
-            # doesn't contain explicit time indicators, treat it as a date.
             if dt_obj_parsed.time() == datetime.min.time():
                 has_time_indicators = any(
                     indicator in datetime_str.upper()
-                    for indicator in [
-                        ":",
-                        "AM",
-                        "PM",
-                        "H",
-                        "T",
-                    ]  # 'T' for ISO8601 T separator
+                    for indicator in [":", "AM", "PM", "H", "T"]
                 )
-                # Also check for numeric time patterns like HHMMSS or HHMM
                 has_numeric_time = re.search(
                     r"\b\d{4,6}\b", datetime_str
-                ) and not re.fullmatch(
-                    r"\d{4}", datetime_str
-                )  # Avoid matching year as time
-
+                ) and not re.fullmatch(r"\d{4}", datetime_str)
                 if not has_time_indicators and not has_numeric_time:
-                    return dt_obj_parsed.date()  # Convert to pure date
+                    return dt_obj_parsed.date()
 
-            # It's a datetime object, ensure timezone awareness if requested
-            if tz_aware and dt_obj_parsed.tzinfo is None:
-                local_tz = pytz.timezone(config.MIRZA_TIMEZONE)
-                dt_obj_parsed = local_tz.localize(dt_obj_parsed)
+            if tz_aware and (
+                dt_obj_parsed.tzinfo is None
+                or dt_obj_parsed.tzinfo.utcoffset(dt_obj_parsed) is None
+            ):
+                target_tz_str = default_localize_tz_str or config.MIRZA_TIMEZONE
+                try:
+                    target_tz = pytz.timezone(target_tz_str)
+                    dt_obj_parsed = target_tz.localize(dt_obj_parsed)
+                except pytz.UnknownTimeZoneError:
+                    logger.warning(
+                        f"Timezone '{target_tz_str}' for localization is unknown. Falling back to UTC."
+                    )
+                    dt_obj_parsed = pytz.utc.localize(dt_obj_parsed)
             return dt_obj_parsed
-        elif isinstance(
-            dt_obj_parsed, date
-        ):  # Should be rare from dateutil_parser.parse directly
+        elif isinstance(dt_obj_parsed, date):
             return dt_obj_parsed
 
-        # Fallback if somehow not datetime or date (shouldn't happen with dateutil)
         return dt_obj_parsed
 
     except (ValueError, TypeError, OverflowError) as e:
