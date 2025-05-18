@@ -65,3 +65,5 @@ data/
 # General log files (if any outside data/logs/)
 *.log
 *.log.*
+
+config.py
