@@ -1,280 +1,258 @@
 # mirai_app/core/communication_manager.py
 
 import logging
-from typing import Optional, Literal
+from typing import Optional, Union
 
-import requests  # We'll need this for actual implementation later
+import telegram  # From python-telegram-bot
+from telegram.error import TelegramError, BadRequest, NetworkError, Forbidden
+from telegram.helpers import escape_markdown
 
+from mirai_app.core import utils
 from mirai_app import config
 
-# from mirai_app.core import utils # Not strictly needed for interface, but good practice
-
-# Configure logging
 logger = logging.getLogger(__name__)
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
-
-# Define supported platforms as literals for type hinting and validation
-TextPlatform = Literal["whatsapp", "telegram", "sms"]  # Add more as needed
-CallPlatform = Literal[
-    "telegram_call", "whatsapp_call", "standard_phone_call"
-]  # Add more as needed
+# BasicConfig will be set by main_orchestrator or if run standalone
 
 
 class CommunicationManager:
     """
-    Manages sending text messages and initiating voice calls to Mirza.
-    This class acts as an abstraction layer over specific communication APIs.
-    Actual API interactions are placeholder for now.
+    Manages sending outgoing messages to Mirza via Telegram.
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        bot_token: Optional[str] = None,
+        mirza_chat_id: Optional[Union[str, int]] = None,
+    ):
         """
         Initializes the CommunicationManager.
-        API keys and user identifiers are expected to be in config.py.
-        """
-        # In a full implementation, you might initialize API clients here.
-        logger.info(
-            "CommunicationManager initialized. (Implementations are placeholders)"
-        )
-        self.default_text_platform: TextPlatform = (
-            "whatsapp"  # Could be set from config
-        )
-        self.default_call_platform: CallPlatform = (
-            "telegram_call"  # Could be set from config
-        )
-
-    def _send_whatsapp_callmebot_text(
-        self, phone_number: str, api_key: str, message: str
-    ) -> bool:
-        """
-        Placeholder for sending a WhatsApp message via CallMeBot API.
-        """
-        logger.info(
-            f"[PLACEHOLDER] Attempting to send WhatsApp (CallMeBot) text to {phone_number}: '{message[:30]}...'"
-        )
-        # --- Actual implementation would go here ---
-        # Example (do not run without actual keys and understanding CallMeBot API):
-        # try:
-        #     url = f"https://api.callmebot.com/whatsapp.php?phone={phone_number}&text={requests.utils.quote(message)}&apikey={api_key}"
-        #     response = requests.get(url, timeout=10)
-        #     response.raise_for_status() # Raise an exception for HTTP errors
-        #     if "ERROR" in response.text.upper(): # CallMeBot specific error check
-        #         logger.error(f"CallMeBot API error for WhatsApp: {response.text}")
-        #         return False
-        #     logger.info("WhatsApp (CallMeBot) text sent successfully (placeholder check).")
-        #     return True
-        # except requests.exceptions.RequestException as e:
-        #     logger.error(f"Error sending WhatsApp (CallMeBot) text: {e}")
-        #     return False
-        # except Exception as e:
-        #     logger.error(f"Unexpected error in _send_whatsapp_callmebot_text: {e}")
-        #     return False
-        return False  # Placeholder return
-
-    def _send_telegram_callmebot_text(self, username: str, message: str) -> bool:
-        """
-        Placeholder for sending a Telegram message via CallMeBot API.
-        Note: CallMeBot Telegram usually requires prior user interaction with the bot.
-        """
-        logger.info(
-            f"[PLACEHOLDER] Attempting to send Telegram (CallMeBot) text to @{username}: '{message[:30]}...'"
-        )
-        # --- Actual implementation would go here ---
-        return False  # Placeholder return
-
-    def _make_telegram_callmebot_call(
-        self, username: str, message_to_speak: str
-    ) -> bool:
-        """
-        Placeholder for making a Telegram call via CallMeBot API.
-        """
-        logger.info(
-            f"[PLACEHOLDER] Attempting to make Telegram (CallMeBot) call to @{username} with message: '{message_to_speak[:30]}...'"
-        )
-        # --- Actual implementation would go here ---
-        return False  # Placeholder return
-
-    # --- Public Interface Methods ---
-
-    def send_text_message(
-        self, message: str, platform: Optional[TextPlatform] = None
-    ) -> bool:
-        """
-        Sends a text message to Mirza.
-
-        The LLM's direct textual responses will be routed through this function
-        by the main_orchestrator. The LLM can also request this function explicitly.
 
         Args:
-            message: The text content of the message.
-            platform: The desired platform ("whatsapp", "telegram", "sms").
-                      If None, uses the default text platform.
-
-        Returns:
-            True if the message was sent (or queued) successfully, False otherwise.
+            bot_token: The Telegram Bot Token. Defaults to config.TELEGRAM_BOT_TOKEN.
+            mirza_chat_id: Mirza's Telegram Chat ID. Defaults to config.MIRZA_TELEGRAM_CHAT_ID.
         """
-        if not message:
-            logger.warning(
-                "Attempted to send an empty text message. Operation skipped."
+        _bot_token = bot_token or config.TELEGRAM_BOT_TOKEN
+        _mirza_chat_id = mirza_chat_id or config.MIRZA_TELEGRAM_CHAT_ID
+
+        if "YOUR_TELEGRAM_BOT_TOKEN_HERE" in _bot_token or not _bot_token:
+            logger.error(
+                "Telegram Bot Token is not configured or is a placeholder. CommunicationManager will not function."
             )
-            return False
+            # Raise an error or handle this more gracefully depending on application requirements
+            # For now, we'll allow initialization but sending will fail.
+            self.bot: Optional[telegram.Bot] = None
+        else:
+            self.bot = telegram.Bot(token=_bot_token)
 
-        chosen_platform = platform or self.default_text_platform
-        logger.info(
-            f"Preparing to send text message via {chosen_platform}: '{message[:50]}...'"
-        )
-
-        if chosen_platform == "whatsapp":
-            # These would come from config.py
-            phone_num = config.CALLMEBOT_PHONE_NUMBER
-            api_key = config.CALLMEBOT_API_KEY_WHATSAPP
-            if (
-                not phone_num
-                or not api_key
-                or "YOUR_" in phone_num
-                or "YOUR_" in api_key
-            ):
+        if (
+            isinstance(_mirza_chat_id, str)
+            and "YOUR_TELEGRAM_USER_ID_HERE" in _mirza_chat_id
+        ):
+            logger.error(
+                "Mirza Telegram Chat ID is not configured or is a placeholder."
+            )
+            self.mirza_chat_id: Optional[Union[str, int]] = None
+        elif (
+            isinstance(_mirza_chat_id, int) and _mirza_chat_id == 0
+        ):  # Default placeholder from config
+            logger.error(
+                "Mirza Telegram Chat ID is not configured (placeholder value 0)."
+            )
+            self.mirza_chat_id: Optional[Union[str, int]] = None
+        else:
+            try:
+                self.mirza_chat_id = int(_mirza_chat_id)
+            except ValueError:
                 logger.error(
-                    "WhatsApp (CallMeBot) credentials not configured properly."
+                    f"MIRZA_TELEGRAM_CHAT_ID '{_mirza_chat_id}' is not a valid integer."
                 )
-                return False
-            return self._send_whatsapp_callmebot_text(phone_num, api_key, message)
+                self.mirza_chat_id = None
 
-        elif chosen_platform == "telegram":
-            username = config.CALLMEBOT_USERNAME_TELEGRAM
-            if not username or "YOUR_" in username:
-                logger.error("Telegram username not configured properly.")
-                return False
-            return self._send_telegram_callmebot_text(username, message)
-
-        # elif chosen_platform == "sms":
-        #     logger.warning("SMS platform not yet implemented (placeholder).")
-        #     return False # Placeholder
-
+        if self.bot and self.mirza_chat_id is not None:
+            logger.info(
+                f"CommunicationManager initialized for Telegram. Target Chat ID: {self.mirza_chat_id}"
+            )
         else:
-            logger.error(f"Unsupported text platform: {chosen_platform}")
-            return False
+            logger.warning(
+                "CommunicationManager initialized but may not be fully functional due to missing Bot Token or Chat ID."
+            )
 
-    def make_voice_call(
-        self, message_to_speak: str, platform: Optional[CallPlatform] = None
+    async def send_text_message(
+        self,
+        text: str,
+        parse_mode: Optional[
+            str
+        ] = None,  # e.g., telegram.constants.ParseMode.MARKDOWN_V2
+        disable_web_page_preview: Optional[bool] = None,
+        reply_to_message_id: Optional[int] = None,
     ) -> bool:
         """
-        Initiates a voice call to Mirza, which acts as an audible alert.
-        Mirza is not expected to "answer" this call in a traditional way but
-        may respond via text message after being alerted.
-
-        The LLM can request this function explicitly (e.g., for critical alerts or wake-ups).
+        Sends a text message to Mirza via Telegram.
 
         Args:
-            message_to_speak: The message that the automated system will speak during the call.
-            platform: The desired call platform ("telegram_call", "whatsapp_call", "standard_phone_call").
-                      If None, uses the default call platform.
+            text: The text content of the message.
+            parse_mode: Optional. Send 'MarkdownV2', 'HTML' or 'Markdown' (legacy).
+            disable_web_page_preview: Optional. Disables link previews for links in this message.
+            reply_to_message_id: Optional. If the message is a reply, ID of the original message.
 
         Returns:
-            True if the call was initiated successfully, False otherwise.
+            True if the message was sent successfully, False otherwise.
         """
-        if not message_to_speak:
-            logger.warning(
-                "Attempted to make a voice call with an empty message. Operation skipped."
+        if not self.bot or self.mirza_chat_id is None:
+            logger.error(
+                "Telegram Bot or Mirza Chat ID not configured. Cannot send message."
+            )
+            return False
+        if not text:
+            logger.warning("Attempted to send an empty text message. Skipped.")
+            return True  # Or False, depending on desired behavior
+
+        try:
+            # Escape text for MarkdownV2 if parse_mode is set to MarkdownV2
+            if parse_mode == telegram.constants.ParseMode.MARKDOWN_V2:
+                text = escape_markdown(text, version=2)
+            elif parse_mode == telegram.constants.ParseMode.MARKDOWN:
+                text = escape_markdown(text, version=1)
+
+            await self.bot.send_message(
+                chat_id=self.mirza_chat_id,
+                text=text,
+                parse_mode=parse_mode,
+                disable_web_page_preview=disable_web_page_preview,
+                reply_to_message_id=reply_to_message_id,
+            )
+            logger.info(
+                f"Sent Telegram message to {self.mirza_chat_id}: '{text[:70]}...'"
+            )
+            return True
+        except Forbidden:
+            logger.error(
+                f"Unauthorized: Bot token might be invalid or bot blocked by user {self.mirza_chat_id}."
+            )
+            return False
+        except BadRequest as e:
+            logger.error(
+                f"BadRequest sending Telegram message to {self.mirza_chat_id}: {e}"
+            )
+            return False
+        except NetworkError as e:
+            logger.error(f"NetworkError sending Telegram message: {e}")
+            # Consider retry logic for network errors in a more advanced implementation
+            return False
+        except TelegramError as e:
+            logger.error(f"TelegramError sending message to {self.mirza_chat_id}: {e}")
+            return False
+        except Exception as e:
+            logger.error(
+                f"Unexpected error sending Telegram message: {type(e).__name__} - {e}"
             )
             return False
 
-        chosen_platform = platform or self.default_call_platform
-        logger.info(
-            f"Preparing to make voice call via {chosen_platform} with message: '{message_to_speak[:50]}...'"
-        )
+    async def send_alert_message(
+        self, alert_text: str, add_alert_prefix: bool = True
+    ) -> bool:
+        """
+        Sends an alert message to Mirza, typically for high-priority notifications.
+        This effectively simulates a "call" by sending a distinct message.
 
-        if chosen_platform == "telegram_call":
-            username = config.CALLMEBOT_USERNAME_TELEGRAM
-            if not username or "YOUR_" in username:
-                logger.error("Telegram username for calls not configured properly.")
-                return False
-            return self._make_telegram_callmebot_call(username, message_to_speak)
+        Args:
+            alert_text: The core text of the alert.
+            add_alert_prefix: If True, prepends an alert emoji/text.
 
-        # elif chosen_platform == "whatsapp_call":
-        #     logger.warning("WhatsApp call platform not yet implemented (placeholder).")
-        #     return False # Placeholder
-        # elif chosen_platform == "standard_phone_call":
-        #     logger.warning("Standard phone call platform not yet implemented (placeholder).")
-        #     return False # Placeholder
+        Returns:
+            True if the alert message was sent successfully, False otherwise.
+        """
+        if not alert_text:
+            logger.warning("Attempted to send an empty alert message. Skipped.")
+            return True
 
-        else:
-            logger.error(f"Unsupported call platform: {chosen_platform}")
-            return False
+        formatted_text = alert_text
+        if add_alert_prefix:
+            formatted_text = f"🚨 MIRAI ALERT 🚨\n\n{alert_text}"
+
+        return await self.send_text_message(text=formatted_text)
 
 
 if __name__ == "__main__":
-    print("\n--- CommunicationManager Test Initialized (Placeholders) ---")
-    manager = CommunicationManager()
+    import asyncio
 
-    # --- Test Send Text Message ---
-    print("\n--- Testing Send Text Message (Placeholder) ---")
-    test_message = "Hello Mirza, this is a test message from MIRAI!"
+    # Configure logger for standalone testing
+    if not logging.getLogger().hasHandlers():
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        )
 
-    # Test with default platform (WhatsApp)
-    print(
-        f"Attempting to send via default text platform ({manager.default_text_platform})..."
-    )
-    success_text_default = manager.send_text_message(test_message)
-    print(
-        f"Send text (default platform) result: {'Success (Placeholder)' if success_text_default else 'Failed (Placeholder)'}"
-    )
-    # In a real test, you'd check your phone or API logs. For now, we expect False due to placeholders.
-    # assert not success_text_default, "Placeholder should return False or be mocked for True"
+    async def main_test_comm_manager():
+        print("\n--- CommunicationManager Test Initialized (Live Telegram Test) ---")
 
-    # Test with explicit platform (Telegram)
-    print(f"\nAttempting to send via Telegram...")
-    success_text_telegram = manager.send_text_message(test_message, platform="telegram")
-    print(
-        f"Send text (Telegram) result: {'Success (Placeholder)' if success_text_telegram else 'Failed (Placeholder)'}"
-    )
-    # assert not success_text_telegram
+        # Ensure token and chat_id are set in config.py or environment variables
+        # For this test to actually send, replace placeholders in config.py or set env vars
+        if (
+            "YOUR_TELEGRAM_BOT_TOKEN_HERE" in config.TELEGRAM_BOT_TOKEN
+            or config.MIRZA_TELEGRAM_CHAT_ID == 0
+            or (
+                isinstance(config.MIRZA_TELEGRAM_USER_ID, str)
+                and "YOUR_TELEGRAM_USER_ID_HERE" in config.MIRZA_TELEGRAM_USER_ID
+            )
+        ):
+            print(
+                "Skipping live Telegram tests: TELEGRAM_BOT_TOKEN or MIRZA_TELEGRAM_CHAT_ID not configured."
+            )
+            print(
+                "Please configure them in mirai_app/config.py or via environment variables to run live tests."
+            )
+            return
 
-    # Test with unsupported platform
-    print(f"\nAttempting to send via unsupported platform (email)...")
-    # success_text_unsupported = manager.send_text_message(test_message, platform="email") # This will cause a type error with Literal
-    # print(f"Send text (email) result: {'Success (Placeholder)' if success_text_unsupported else 'Failed (Placeholder)'}")
-    # For now, we can't directly pass an invalid Literal. The type checker would catch it.
-    # We can test the else branch by temporarily modifying the Literal or the chosen_platform.
-    # This test is more about the internal logic if somehow an invalid platform string got through.
-    manager.default_text_platform = (
-        "non_existent_platform"  # Temporarily override for test
-    )
-    success_text_invalid_internal = manager.send_text_message(
-        test_message, platform="non_existent_platform"
-    )
-    print(
-        f"Send text (internally invalid platform) result: {'Success (Placeholder)' if success_text_invalid_internal else 'Failed (Placeholder)'}"
-    )
-    assert not success_text_invalid_internal
-    manager.default_text_platform = "whatsapp"  # Reset to valid default
+        manager = CommunicationManager()
+        if not manager.bot or manager.mirza_chat_id is None:
+            print(
+                "CommunicationManager could not be initialized properly with bot/chat_id. Aborting test."
+            )
+            return
 
-    # --- Test Make Voice Call ---
-    print("\n--- Testing Make Voice Call (Placeholder) ---")
-    call_message = "Good morning Mirza! Time to wake up."
+        # --- Test Send Simple Text Message ---
+        print("\n--- Testing Send Simple Text Message ---")
+        test_message_simple = f"Hello Mirza, this is a test message from MIRAI's CommunicationManager at {utils.get_current_datetime_local().strftime('%Y-%m-%d %H:%M:%S')}."
+        success_simple = await manager.send_text_message(test_message_simple)
+        print(f"Send simple text result: {'Success' if success_simple else 'Failed'}")
+        assert (
+            success_simple  # This will fail if token/chat_id is wrong or bot is blocked
+        )
 
-    # Test with default platform (Telegram Call)
-    print(
-        f"Attempting to call via default call platform ({manager.default_call_platform})..."
-    )
-    success_call_default = manager.make_voice_call(call_message)
-    print(
-        f"Make call (default platform) result: {'Success (Placeholder)' if success_call_default else 'Failed (Placeholder)'}"
-    )
-    # assert not success_call_default
+        await asyncio.sleep(1)  # Small delay between messages
 
-    # Test with explicit platform (if we had another placeholder)
-    # print(f"\nAttempting to call via WhatsApp Call...")
-    # success_call_whatsapp = manager.make_voice_call(call_message, platform="whatsapp_call")
-    # print(f"Make call (WhatsApp Call) result: {'Success (Placeholder)' if success_call_whatsapp else 'Failed (Placeholder)'}")
-    # assert not success_call_whatsapp
+        # --- Test Send Alert Message ---
+        print("\n--- Testing Send Alert Message ---")
+        test_message_alert = (
+            "This is a critical alert test. Please acknowledge via chat."
+        )
+        success_alert = await manager.send_alert_message(test_message_alert)
+        print(f"Send alert message result: {'Success' if success_alert else 'Failed'}")
+        assert success_alert
 
-    print("\n--- CommunicationManager Testing Complete (Placeholders) ---")
-    print(
-        "NOTE: Actual sending depends on configured API keys and implemented private methods."
-    )
-    print(
-        "For now, functions will likely return False or log errors if keys are placeholders."
-    )
+        await asyncio.sleep(1)
+
+        # --- Test Send Message with MarkdownV2 ---
+        print("\n--- Testing Send Message with MarkdownV2 ---")
+        markdown_text = (
+            "*Hello* _Mirza_! This is a ~test~ message with `MarkdownV2` formatting.\n"
+            "Visit [python-telegram-bot](https://python-telegram-bot.org) for more info."  # Escaped .
+        )
+        success_markdown = await manager.send_text_message(
+            markdown_text, parse_mode=telegram.constants.ParseMode.MARKDOWN_V2
+        )
+        print(
+            f"Send MarkdownV2 text result: {'Success' if success_markdown else 'Failed'}"
+        )
+        assert success_markdown
+
+        print("\n--- CommunicationManager Live Testing Complete ---")
+        print(
+            f"Check your Telegram chat with the bot (Chat ID: {manager.mirza_chat_id}) for messages."
+        )
+
+    if __name__ == "__main__":
+        # This will run the async main_test function
+        # Ensure you have a running asyncio event loop if importing and calling elsewhere
+        asyncio.run(main_test_comm_manager())
