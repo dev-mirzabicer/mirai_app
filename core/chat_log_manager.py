@@ -3,7 +3,9 @@
 import logging
 from pathlib import Path
 from datetime import datetime, date, timedelta
-from typing import Optional, Literal, List, Union
+from typing import Optional, Literal, List, Union, Dict
+import re
+from google.genai.types import Content, Part
 
 from mirai_app import config
 from mirai_app.core import utils
@@ -155,6 +157,47 @@ class ChatLogManager:
             return ""
 
         return "\n".join(all_history_parts).strip()
+
+    async def get_daily_chat_history_as_contents(
+        self, chat_date: date
+    ) -> List[Content]:
+        raw_content = await self.get_daily_chat_content(chat_date)
+        if not raw_content:
+            logger.info(
+                f"No chat log content found for {chat_date.strftime('%Y-%m-%d')} to parse into Contents."
+            )
+            return []
+
+        entries: List[Dict[str, str]] = []
+        log_entry_pattern = re.compile(r"^\[(.*?)\]\s+(Mirza|MIRAI):\s+(.*)$")
+
+        for line in raw_content.splitlines():
+            m = log_entry_pattern.match(line)
+            if m:
+                # start a fresh entry
+                entries.append({"speaker": m.group(2), "message": m.group(3)})
+            else:
+                # continuation of the last entry
+                if entries:
+                    entries[-1]["message"] += "\n" + line.strip()
+
+        history_contents: List[Content] = []
+        for e in entries:
+            text = e["message"]
+            if e["speaker"] == "Mirza":
+                text = f"[!Mirza!] {text}"
+                history_contents.append(
+                    Content(role="user", parts=[Part.from_text(text=text)])
+                )
+            else:
+                history_contents.append(
+                    Content(role="model", parts=[Part.from_text(text=text)])
+                )
+
+        logger.info(
+            f"Parsed {len(history_contents)} messages from chat log for {chat_date.strftime('%Y-%m-%d')} into Content objects."
+        )
+        return history_contents
 
 
 if __name__ == "__main__":
