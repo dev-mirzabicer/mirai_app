@@ -3,7 +3,9 @@
 import json
 import logging
 import asyncio
+import datetime  # Ensure datetime is imported
 from typing import Any, Callable, Coroutine
+from datetime import datetime, date, timedelta
 
 from google.genai import types as genai_types
 
@@ -46,6 +48,10 @@ class FunctionHandler:
             "list_calendar_events_in_range": calendar_mgr.list_events_in_range,
             # RemindersManager
             "create_reminder": reminders_mgr.create_reminder,
+            "get_reminder": reminders_mgr.get_reminder,
+            "update_reminder": reminders_mgr.update_reminder,
+            "delete_reminder": reminders_mgr.delete_reminder,
+            "query_reminders": reminders_mgr.query_reminders,
             # HabitsManager
             "get_habits_content": habits_mgr.get_habits_content,
             "update_habits_content": habits_mgr.update_habits_content,
@@ -62,6 +68,21 @@ class FunctionHandler:
             "get_chat_history_for_reference": chat_log_mgr.get_chat_history_for_prompt,
         }
         logger.info("FunctionHandler initialized with provided manager instances.")
+
+    def _make_json_serializable(self, item: Any) -> Any:
+        """Recursively converts datetime, date, and timedelta objects in an item to strings."""
+        if isinstance(item, list):
+            return [self._make_json_serializable(i) for i in item]
+        elif isinstance(item, dict):
+            return {k: self._make_json_serializable(v) for k, v in item.items()}
+        elif isinstance(item, datetime):
+            return item.isoformat()
+        elif isinstance(item, date):
+            return item.isoformat()
+        elif isinstance(item, timedelta):
+            return str(item)  # Or item.total_seconds() if preferred
+        else:
+            return item
 
     async def dispatch_function_call(
         self,
@@ -110,12 +131,14 @@ class FunctionHandler:
             else:
                 result = method_to_call(**args)
 
+            serializable_result = self._make_json_serializable(result)
+
             logger.info(
-                f"Function {function_name} executed successfully. Result: {str(result)[:200]}..."
+                f"Function {function_name} executed successfully. Serializable result: {str(serializable_result)[:200]}..."
             )
             return genai_types.Part.from_function_response(
                 name=function_name,
-                response={"output": result},
+                response={"output": serializable_result},
             )
         except ValueError as e:
             logger.error(f"ValueError executing {function_name}: {e}")
