@@ -65,5 +65,3 @@ data/
 # General log files (if any outside data/logs/)
 *.log
 *.log.*
-
-mirai_app/config.py
