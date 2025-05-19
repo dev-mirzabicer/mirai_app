@@ -66,4 +66,4 @@ data/
 *.log
 *.log.*
 
-config.py
+mirai_app/config.py
