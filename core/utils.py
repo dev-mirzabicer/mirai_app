@@ -2,21 +2,21 @@
 
 import json
 import uuid
+import logging
 import re
-from datetime import datetime, timezone, timedelta, date
+from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional, List, Union
 
 import pytz
+import dateparser
 from dateutil import parser as dateutil_parser
-from dateutil.parser import isoparse
-
-import logging
+from dateutil.parser import isoparse, ParserError as DateutilParserError
+from dateutil.relativedelta import relativedelta
 
 from mirai_app import config
 
 logger = logging.getLogger(__name__)
-# Ensure logging is configured by the main app or if run standalone
 if not logger.hasHandlers():
     logging.basicConfig(
         level=logging.INFO,
@@ -27,48 +27,34 @@ if not logger.hasHandlers():
 
 
 def get_current_datetime_utc() -> datetime:
-    """Returns the current datetime in UTC."""
     return datetime.now(timezone.utc)
 
 
 def get_current_datetime_local() -> datetime:
-    """Returns the current datetime in Mirza's local timezone."""
     try:
         local_tz = pytz.timezone(config.MIRZA_TIMEZONE)
         return datetime.now(local_tz)
     except pytz.UnknownTimeZoneError:
         logger.error(
-            f"MIRZA_TIMEZONE '{config.MIRZA_TIMEZONE}' is unknown. Falling back to UTC."
+            f"Unknown timezone '{config.MIRZA_TIMEZONE}', falling back to UTC."
         )
         return datetime.now(timezone.utc)
 
 
 def format_datetime_iso(dt_obj: Union[datetime, date]) -> str:
-    """Formats a datetime or date object to ISO 8601 string (UTC if naive datetime)."""
-    if isinstance(dt_obj, datetime):
-        if dt_obj.tzinfo is None:
-            dt_obj = dt_obj.replace(tzinfo=timezone.utc)
+    if isinstance(dt_obj, datetime) and dt_obj.tzinfo is None:
+        dt_obj = dt_obj.replace(tzinfo=timezone.utc)
     return dt_obj.isoformat()
 
 
 def format_datetime_for_llm(dt_obj: Union[datetime, date]) -> str:
-    """
-    Formats a datetime or date object into a human-readable string for the LLM.
-    For datetimes, includes timezone name. For dates, just YYYY-MM-DD.
-    """
     if isinstance(dt_obj, datetime):
         if dt_obj.tzinfo is None or dt_obj.tzinfo.utcoffset(dt_obj) is None:
             try:
-                local_tz = pytz.timezone(config.MIRZA_TIMEZONE)
-                dt_obj = (
-                    local_tz.localize(dt_obj)
-                    if dt_obj.tzinfo is None
-                    else dt_obj.astimezone(local_tz)
-                )
-            except pytz.UnknownTimeZoneError:
-                logger.warning(
-                    f"MIRZA_TIMEZONE '{config.MIRZA_TIMEZONE}' unknown in format_datetime_for_llm. Using naive or original TZ."
-                )
+                tz = pytz.timezone(config.MIRZA_TIMEZONE)
+                dt_obj = tz.localize(dt_obj)
+            except Exception:
+                dt_obj = dt_obj.replace(tzinfo=timezone.utc)
         return dt_obj.strftime("%Y-%m-%d %H:%M:%S %Z")
     elif isinstance(dt_obj, date):
         return dt_obj.strftime("%Y-%m-%d")
@@ -78,385 +64,217 @@ def format_datetime_for_llm(dt_obj: Union[datetime, date]) -> str:
 def parse_datetime_flexible(
     datetime_str: str,
     tz_aware: bool = True,
-    default_localize_tz_str: Optional[str] = None,  # <-- New parameter
+    default_localize_tz_str: Optional[str] = None,
 ) -> Optional[Union[datetime, date]]:
     """
-    Parses a datetime string.
-    If the string represents only a date, it attempts to return a datetime.date object.
-    If tz_aware is True and the parsed result is a naive datetime.datetime object:
-      - It localizes using default_localize_tz_str if provided.
-      - Otherwise, it localizes to config.MIRZA_TIMEZONE.
+    Parse absolute or natural language date/time strings using dateparser with fallback to dateutil.
+    Maintains same signature for compatibility.
     """
-    if not datetime_str:
+    if not datetime_str or not datetime_str.strip():
         return None
+    settings = {
+        "RETURN_AS_TIMEZONE_AWARE": tz_aware,
+        "TIMEZONE": default_localize_tz_str or config.MIRZA_TIMEZONE,
+        "TO_TIMEZONE": default_localize_tz_str or config.MIRZA_TIMEZONE,
+        "PREFER_DATES_FROM": "future",
+        "RELATIVE_BASE": get_current_datetime_local(),
+    }
     try:
+        parsed = dateparser.parse(datetime_str, settings=settings)
+        if parsed:
+            # If time part is midnight and no explicit time in string, return date
+            if parsed.time() == datetime.min.time():
+                # detect explicit time tokens
+                if not re.search(
+                    r"\d{1,2}:\d{2}|AM|PM|at ", datetime_str, re.IGNORECASE
+                ):
+                    return parsed.date()
+            return parsed
+    except Exception as e:
+        logger.warning(f"dateparser failed for '{datetime_str}': {e}")
+    # Fallback to dateutil
+    try:
+        # Handle strict YYYY-MM-DD
         if re.fullmatch(r"\d{4}-\d{2}-\d{2}", datetime_str):
-            try:
-                return isoparse(datetime_str).date()
-            except ValueError:
-                pass
-
-        dt_obj_parsed = dateutil_parser.parse(datetime_str)
-
-        if isinstance(dt_obj_parsed, datetime):
-            if dt_obj_parsed.time() == datetime.min.time():
-                has_time_indicators = any(
-                    indicator in datetime_str.upper()
-                    for indicator in [":", "AM", "PM", "H", "T"]
-                )
-                has_numeric_time = re.search(
-                    r"\b\d{4,6}\b", datetime_str
-                ) and not re.fullmatch(r"\d{4}", datetime_str)
-                if not has_time_indicators and not has_numeric_time:
-                    return dt_obj_parsed.date()
-
-            if tz_aware and (
-                dt_obj_parsed.tzinfo is None
-                or dt_obj_parsed.tzinfo.utcoffset(dt_obj_parsed) is None
-            ):
-                target_tz_str = default_localize_tz_str or config.MIRZA_TIMEZONE
-                try:
-                    target_tz = pytz.timezone(target_tz_str)
-                    dt_obj_parsed = target_tz.localize(dt_obj_parsed)
-                except pytz.UnknownTimeZoneError:
-                    logger.warning(
-                        f"Timezone '{target_tz_str}' for localization is unknown. Falling back to UTC."
-                    )
-                    dt_obj_parsed = pytz.utc.localize(dt_obj_parsed)
-            return dt_obj_parsed
-        elif isinstance(dt_obj_parsed, date):
-            return dt_obj_parsed
-
-        return dt_obj_parsed
-
-    except (ValueError, TypeError, OverflowError) as e:
-        logger.warning(
-            f"Failed to parse datetime string '{datetime_str}': {type(e).__name__} - {e}"
-        )
-        return None
+            return isoparse(datetime_str).date()
+        dt = dateutil_parser.parse(datetime_str)
+        if (
+            tz_aware
+            and isinstance(dt, datetime)
+            and (dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None)
+        ):
+            tz = pytz.timezone(default_localize_tz_str or config.MIRZA_TIMEZONE)
+            dt = tz.localize(dt)
+        return dt
+    except (DateutilParserError, ValueError) as e:
+        logger.warning(f"dateutil failed for '{datetime_str}': {e}")
+    return None
 
 
 def _parse_duration_string(duration_str: str) -> Optional[tuple[int, str]]:
-    """Helper to parse duration string into value and unit type."""
     if not duration_str:
         return None
-    # Regex to capture value and unit.
     match = re.match(
-        r"(\d+)\s*(days?|weeks?|months?|hours?|minutes?|d|w|mon|h|m)",
+        r"(\d+)\s*(years?|months?|weeks?|days?|hours?|minutes?|secs?|s|m|h|d|w)",
         duration_str,
         re.IGNORECASE,
     )
-    if not match:
-        # Try ISO 8601 duration format like P1D, PT1H (simplified)
-        iso_match = re.match(
-            r"P(?:(\d+)Y)?(?:(\d+)M)?(?:(\d+)W)?(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?",
-            duration_str.upper(),
-        )
-        if iso_match:
-            years, months, weeks, days, hours, minutes, seconds = [
-                int(g) if g else 0 for g in iso_match.groups()
-            ]
-            if years > 0:
-                return years * 12, "months"  # Approximate years to months
-            if months > 0:
-                return months, "months"
-            if weeks > 0:
-                return weeks, "weeks"
-            if days > 0:
-                return days, "days"
-            if hours > 0:
-                return hours, "hours"
-            if minutes > 0:
-                return minutes, "minutes"
-            # Seconds duration not directly used for event.add('duration', timedelta) in this simplified parser
-            logger.warning(
-                f"Seconds from ISO duration '{duration_str}' not directly converted by _parse_duration_string."
-            )
-            return None  # Or handle seconds if needed by returning timedelta directly
-        return None
-
-    value = int(match.group(1))
-    unit_str_matched = match.group(2).lower()
-
-    if unit_str_matched in ["minute", "minutes", "min", "m"]:
-        unit_type = "minutes"
-    elif unit_str_matched in ["hour", "hours", "h"]:
-        unit_type = "hours"
-    elif unit_str_matched in ["day", "days", "d"]:
-        unit_type = "days"
-    elif unit_str_matched in ["week", "weeks", "w"]:
-        unit_type = "weeks"
-    elif unit_str_matched in ["month", "months", "mon"]:
-        unit_type = "months"
-    else:
-        logger.warning(
-            f"Unmatched unit string after regex: '{unit_str_matched}' from '{duration_str}'"
-        )
-        return None
-    return value, unit_type
+    if match:
+        value = int(match.group(1))
+        unit = match.group(2).lower()
+        if unit.startswith("year"):
+            return value * 12, "months"
+        if unit.startswith("month"):
+            return value, "months"
+        if unit.startswith("week"):
+            return value, "weeks"
+        if unit.startswith("day"):
+            return value, "days"
+        if unit.startswith("hour") or unit == "h":
+            return value, "hours"
+        if unit.startswith("min") or unit == "m":
+            return value, "minutes"
+        if unit.startswith("sec") or unit == "s":
+            return value, "seconds"
+    # ISO8601 fallback
+    iso = re.match(
+        r"P(?:(\d+)Y)?(?:(\d+)M)?(?:(\d+)W)?(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?",
+        duration_str.upper(),
+    )
+    if iso:
+        parts = [int(p) if p else 0 for p in iso.groups()]
+        years, months, weeks, days, hours, minutes, seconds = parts
+        if years:
+            return years * 12, "months"
+        if months:
+            return months, "months"
+        if weeks:
+            return weeks, "weeks"
+        if days:
+            return days, "days"
+        if hours:
+            return hours, "hours"
+        if minutes:
+            return minutes, "minutes"
+    return None
 
 
 def calculate_expiry_date(
     base_dt: datetime, duration_str: Optional[str]
 ) -> Optional[datetime]:
-    """
-    Calculates an expiry date based on a duration string (e.g., "1 day", "2 weeks", "30min").
-    Returns None if duration_str is None, "forever", or invalid.
-    """
     if not duration_str or duration_str.lower() == "forever":
         return None
-
-    parsed_duration = _parse_duration_string(duration_str)
-    if not parsed_duration:
+    parsed = _parse_duration_string(duration_str)
+    if not parsed:
         return None
-
-    value, unit_type = parsed_duration
-
-    if unit_type == "minutes":
+    value, unit = parsed
+    if unit == "seconds":
+        return base_dt + timedelta(seconds=value)
+    if unit == "minutes":
         return base_dt + timedelta(minutes=value)
-    elif unit_type == "hours":
+    if unit == "hours":
         return base_dt + timedelta(hours=value)
-    elif unit_type == "days":
+    if unit == "days":
         return base_dt + timedelta(days=value)
-    elif unit_type == "weeks":
+    if unit == "weeks":
         return base_dt + timedelta(weeks=value)
-    elif unit_type == "months":
-        return base_dt + timedelta(days=value * 30)  # Approximation
-
+    if unit == "months":
+        return base_dt + relativedelta(months=value)
     return None
 
 
 def calculate_notification_times(
     due_datetime: datetime, notify_before_list: List[str]
 ) -> List[datetime]:
-    """
-    Calculates specific notification datetimes based on a due_datetime and a list of "notify before" durations.
-    """
-    notification_datetimes = []
-    if not notify_before_list:
-        return []
-
-    for duration_str in notify_before_list:
-        parsed_duration = _parse_duration_string(duration_str)
-        if not parsed_duration:
+    times = []
+    for ds in set(notify_before_list or []):
+        parsed = _parse_duration_string(ds)
+        if not parsed:
             continue
-
-        value, unit_type = parsed_duration
+        val, unit = parsed
         delta = None
-
-        if unit_type == "minutes":
-            delta = timedelta(minutes=value)
-        elif unit_type == "hours":
-            delta = timedelta(hours=value)
-        elif unit_type == "days":
-            delta = timedelta(days=value)
-        elif unit_type == "weeks":
-            delta = timedelta(weeks=value)
-        elif unit_type == "months":
-            delta = timedelta(days=value * 30)  # Approximation
-
+        if unit == "seconds":
+            delta = timedelta(seconds=val)
+        elif unit == "minutes":
+            delta = timedelta(minutes=val)
+        elif unit == "hours":
+            delta = timedelta(hours=val)
+        elif unit == "days":
+            delta = timedelta(days=val)
+        elif unit == "weeks":
+            delta = timedelta(weeks=val)
+        elif unit == "months":
+            delta = relativedelta(months=val)
         if delta:
-            notification_datetimes.append(due_datetime - delta)
-
-    return sorted(list(set(notification_datetimes)))
-
-
-# --- String & ID Utilities ---
+            times.append(due_datetime - delta)
+    return sorted(times)
 
 
 def slugify(text: str) -> str:
-    """
-    Convert a string to a URL-friendly slug.
-    Example: "My Awesome Task!" -> "my_awesome_task"
-    """
     if not text:
         return ""
     text = text.lower()
-    text = re.sub(
-        r"[^\w\s-]", "", text
-    )  # Remove non-alphanumeric characters except spaces and hyphens
-    text = re.sub(r"[\s_-]+", "_", text).strip(
-        "_"
-    )  # Replace spaces/hyphens with single underscore
+    text = re.sub(r"[^\w\s-]", "", text)
+    text = re.sub(r"[\s_-]+", "_", text).strip("_")
     return text
 
 
 def generate_unique_id(
     prefix: str = "", name_elements: Optional[List[str]] = None
 ) -> str:
-    """
-    Generates a unique ID.
-    Format: {prefix}_{YYYYMMDDHHMMSS}_{slugified_name_elements}_{random_suffix}
-    If name_elements are provided, they are slugified and included.
-    """
-    timestamp = get_current_datetime_utc().strftime("%Y%m%d%H%M%S")
-    random_suffix = uuid.uuid4().hex[:6]  # Short random suffix
-
-    parts = []
-    if prefix:
-        parts.append(prefix)
-    parts.append(timestamp)
-
+    ts = get_current_datetime_utc().strftime("%Y%m%d%H%M%S")
+    suffix = uuid.uuid4().hex[:6]
+    parts = [prefix] if prefix else []
+    parts.append(ts)
     if name_elements:
-        slugified_name = slugify("_".join(filter(None, name_elements)))
-        if slugified_name:
-            parts.append(slugified_name[:30])  # Limit length of slug part
-
-    parts.append(random_suffix)
+        slug = slugify("_".join(filter(None, name_elements)))[:30]
+        if slug:
+            parts.append(slug)
+    parts.append(suffix)
     return "_".join(parts)
 
 
-# --- File I/O Utilities ---
-
-
 def read_json_file(file_path: Path, default_content: Any = None) -> Any:
-    """Reads a JSON file. Returns default_content if file doesn't exist or is invalid."""
     if not file_path.exists():
-        if default_content is not None and (isinstance(default_content, (list, dict))):
-            write_json_file(
-                file_path, default_content
-            )  # Create with default if specified
-        return (
-            default_content if default_content is not None else []
-        )  # Default to empty list for typical use
+        if default_content is not None and isinstance(default_content, (dict, list)):
+            write_json_file(file_path, default_content)
+        return default_content if default_content is not None else []
     try:
-        with file_path.open("r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, IOError):
+        return json.loads(file_path.read_text(encoding="utf-8"))
+    except Exception:
         return default_content if default_content is not None else []
 
 
 def write_json_file(file_path: Path, data: Any) -> bool:
-    """Writes data to a JSON file."""
     try:
-        with file_path.open("w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text(
+            json.dumps(data, indent=4, ensure_ascii=False), encoding="utf-8"
+        )
         return True
-    except IOError:
+    except Exception:
         return False
 
 
 def read_md_file(file_path: Path, default_content: str = "") -> str:
-    """Reads a Markdown file. Returns default_content if file doesn't exist."""
     if not file_path.exists():
-        if (
-            default_content
-        ):  # Only write if default_content is not empty, to avoid creating empty files unnecessarily
+        if default_content:
             write_md_file(file_path, default_content)
         return default_content
     try:
         return file_path.read_text(encoding="utf-8")
-    except IOError:
+    except Exception:
         return default_content
 
 
 def write_md_file(file_path: Path, content: str) -> bool:
-    """Writes content to a Markdown file."""
     try:
+        file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(content, encoding="utf-8")
         return True
-    except IOError:
+    except Exception:
         return False
 
 
-# --- Other Utilities ---
 def get_mirza_location() -> str:
-    """
-    Gets Mirza's current location.
-    Placeholder: For now, returns default. Could be dynamic later.
-    """
     return config.MIRZA_LOCATION_DEFAULT
-
-
-if __name__ == "__main__":
-
-    # Configure logger here
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    )
-
-    print("--- Testing Date/Time Utilities ---")
-    now_utc = get_current_datetime_utc()
-    now_local = get_current_datetime_local()
-    print(f"Current UTC: {format_datetime_iso(now_utc)}")
-    print(f"Current Local ({config.MIRZA_TIMEZONE}): {format_datetime_iso(now_local)}")
-    print(f"Current Local for LLM: {format_datetime_for_llm(now_local)}")
-
-    parsed_dt_str = "2025-06-15 10:30 PM"
-    parsed_dt = parse_datetime_flexible(parsed_dt_str)
-    if parsed_dt:
-        print(
-            f"Parsed '{parsed_dt_str}': {format_datetime_iso(parsed_dt)} ({parsed_dt.tzinfo})"
-        )
-    else:
-        print(f"Failed to parse '{parsed_dt_str}'")
-
-    parsed_dt_naive_str = "2025-07-01 09:00"
-    parsed_dt_naive = parse_datetime_flexible(parsed_dt_naive_str, tz_aware=True)
-    if parsed_dt_naive:
-        print(
-            f"Parsed naive '{parsed_dt_naive_str}' (tz_aware=True): {format_datetime_iso(parsed_dt_naive)} ({parsed_dt_naive.tzinfo})"
-        )
-
-    expiry_test_dt = get_current_datetime_local()
-    print(
-        f"Expiry from '{format_datetime_for_llm(expiry_test_dt)}' + '2 days': {format_datetime_for_llm(calculate_expiry_date(expiry_test_dt, '2 days')) if calculate_expiry_date(expiry_test_dt, '2 days') else 'None'}"
-    )
-    print(
-        f"Expiry from '{format_datetime_for_llm(expiry_test_dt)}' + '30min': {format_datetime_for_llm(calculate_expiry_date(expiry_test_dt, '30min')) if calculate_expiry_date(expiry_test_dt, '30min') else 'None'}"
-    )
-    print(
-        f"Expiry from '{format_datetime_for_llm(expiry_test_dt)}' + '1mon': {format_datetime_for_llm(calculate_expiry_date(expiry_test_dt, '1mon')) if calculate_expiry_date(expiry_test_dt, '1mon') else 'None'}"
-    )  # Test for month
-    print(
-        f"Expiry from '{format_datetime_for_llm(expiry_test_dt)}' + 'forever': {calculate_expiry_date(expiry_test_dt, 'forever')}"
-    )
-
-    due_time = parse_datetime_flexible("2025-12-25 14:00:00")
-    notify_prefs = ["1d", "2h", "15min", "1w"]  # Added 1 week
-    notif_times = calculate_notification_times(due_time, notify_prefs)
-    print(
-        f"Notification times for due {format_datetime_for_llm(due_time)} with prefs {notify_prefs}:"
-    )
-    for nt in notif_times:
-        print(f"  - {format_datetime_for_llm(nt)}")
-
-    print("\n--- Testing String & ID Utilities ---")
-    print(f"Slugify 'My Awesome Task!': {slugify('My Awesome Task!')}")
-    print(
-        f"Slugify '  Another  Example--Project  ': {slugify('  Another  Example--Project  ')}"
-    )
-    print(f"Generated ID (no prefix, no name): {generate_unique_id()}")
-    print(f"Generated ID (prefix='task'): {generate_unique_id(prefix='task')}")
-    print(
-        f"Generated ID (name_elements=['Buy Groceries', 'Milk and Eggs']): {generate_unique_id(name_elements=['Buy Groceries', 'Milk and Eggs'])}"
-    )
-    print(
-        f"Generated ID (prefix='note', name_elements=['Important Idea']): {generate_unique_id(prefix='note', name_elements=['Important Idea'])}"
-    )
-
-    print("\n--- Testing File I/O Utilities (dummy operations) ---")
-    dummy_json_path = config.DATA_DIR / "dummy_test.json"
-    dummy_md_path = config.DATA_DIR / "dummy_test.md"
-
-    # Test with default content creation
-    non_existent_json = config.DATA_DIR / "new_default.json"
-    if non_existent_json.exists():
-        non_existent_json.unlink()  # ensure it doesn't exist
-    print(
-        f"Read non-existent JSON with default list: {read_json_file(non_existent_json, default_content=[])}"
-    )
-    print(f"Does {non_existent_json.name} exist now? {non_existent_json.exists()}")
-
-    write_json_file(dummy_json_path, {"test": "data", "value": 123})
-    print(f"Read from {dummy_json_path.name}: {read_json_file(dummy_json_path)}")
-    if dummy_json_path.exists():
-        dummy_json_path.unlink()  # Clean up
-
-    write_md_file(dummy_md_path, "# Test Markdown\nThis is a test.")
-    print(f"Read from {dummy_md_path.name}: \n{read_md_file(dummy_md_path)}")
-    if dummy_md_path.exists():
-        dummy_md_path.unlink()  # Clean up
-
-    print(f"\nMirza's default location: {get_mirza_location()}")
