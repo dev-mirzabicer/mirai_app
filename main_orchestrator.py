@@ -4,27 +4,26 @@
 import asyncio
 import logging
 import signal
-import json  # Added json for serializing args in logging
-from datetime import datetime, date, timezone, timedelta  # timezone from datetime
-from typing import List, Optional, Tuple  # Added Tuple
+import json
+from datetime import datetime, date, timezone, timedelta
+from typing import List, Optional, Tuple
 
 # Third-Party
-import pytz  # Keep pytz for now, as per user request
+import pytz
 from telegram import Update
 from telegram.ext import (
     Application,
     ApplicationBuilder,
     MessageHandler,
-    CommandHandler,  # For potential future commands
+    CommandHandler,
     ContextTypes,
     filters,
-    # PicklePersistence, # Optional: for PTB persistence
     Defaults,
 )
-from google.genai.types import Content, Part  # For constructing LLM history
+from google.genai.types import Content, Part, FunctionCall
 
 # MIRAI Application Modules
-from mirai_app import config  # Assumes config.py is in mirai_app directory
+from mirai_app import config
 from mirai_app.core import utils
 from mirai_app.core.tasks_manager import TasksManager
 from mirai_app.core.notes_manager import NotesManager
@@ -35,23 +34,18 @@ from mirai_app.core.log_manager import LogManager
 from mirai_app.core.communication_manager import CommunicationManager
 from mirai_app.core.chat_log_manager import ChatLogManager
 
-# from mirai_app.core.about_mirza_manager import AboutMirzaManager # If it becomes a class
-
 from mirai_app.llm_interface.gemini_client import GeminiClient
 from mirai_app.llm_interface.prompt_builder import PromptBuilder
-from mirai_app.llm_interface.function_handler import FunctionHandler  # Import the class
+from mirai_app.llm_interface.function_handler import FunctionHandler
 
-# Global logger instance for this module
 logger = logging.getLogger(__name__)
 
 
 class MiraiOrchestrator:
     def __init__(self):
-        # 1. Configuration & Logging Setup (early)
         self._configure_logging()
         logger.info("Initializing MIRAI Orchestrator...")
 
-        # 2. Initialize Core Managers (SINGLETONS for the orchestrator)
         self.tasks_mgr = TasksManager()
         self.notes_mgr = NotesManager()
         self.calendar_mgr = CalendarManager()
@@ -59,12 +53,8 @@ class MiraiOrchestrator:
         self.habits_mgr = HabitsManager()
         self.log_mgr = LogManager()
         self.chat_log_mgr = ChatLogManager()
-        self.comm_mgr = (
-            CommunicationManager()
-        )  # Initialize before FunctionHandler if it needs it
-        # self.about_mirza_mgr = AboutMirzaManager() # If it becomes a class
+        self.comm_mgr = CommunicationManager()
 
-        # 3. Initialize LLM Interface Components
         self.gemini_client = GeminiClient()
         if not self.gemini_client.is_ready():
             logger.critical("GeminiClient failed to initialize. MIRAI cannot function.")
@@ -80,7 +70,6 @@ class MiraiOrchestrator:
             chat_log_mgr=self.chat_log_mgr,
         )
 
-        # Initialize FunctionHandler with orchestrator's manager instances
         self.function_handler_instance = FunctionHandler(
             tasks_mgr=self.tasks_mgr,
             notes_mgr=self.notes_mgr,
@@ -92,32 +81,26 @@ class MiraiOrchestrator:
             chat_log_mgr=self.chat_log_mgr,
         )
 
-        # 4. Initialize Communication Manager (for outgoing messages) - already done above
         if not self.comm_mgr.bot or self.comm_mgr.mirza_chat_id is None:
             logger.warning(
                 "CommunicationManager may not be fully functional (missing Telegram Bot Token or Mirza Chat ID)."
             )
 
-        # 5. Initialize Telegram Bot Application (PTB)
-        # Using pytz as per user request to not change this part yet
         ptb_defaults = Defaults(
             tzinfo=pytz.timezone(config.MIRZA_TIMEZONE),
-            parse_mode=None,  # Default to plain text; LLM can specify via tool
+            parse_mode=None,
         )
-        # self.persistence = PicklePersistence(filepath=config.DATA_DIR / "ptb_persistence.pickle") # Optional
-
         self.ptb_application = (
             ApplicationBuilder()
-            .token(config.TELEGRAM_BOT_TOKEN)  # Assumes TELEGRAM_BOT_TOKEN in config
-            # .persistence(self.persistence) # Optional
+            .token(config.TELEGRAM_BOT_TOKEN)
             .defaults(ptb_defaults)
             .build()
         )
-        self.bot = self.ptb_application.bot  # Convenience accessor
+        self.bot = self.ptb_application.bot
 
-        # 6. State for graceful shutdown and periodic tasks
         self.stop_event = asyncio.Event()
         self.periodic_tasks: List[asyncio.Task] = []
+        self._shutdown_called_flag = False
 
         logger.info("MIRAI Orchestrator initialized components.")
 
@@ -128,20 +111,16 @@ class MiraiOrchestrator:
         logging.basicConfig(
             level=numeric_log_level,
             format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-            handlers=[
-                logging.StreamHandler()
-            ],  # Add FileHandler for production if needed
+            handlers=[logging.StreamHandler()],
         )
-        # Silence overly verbose loggers from libraries if necessary
         logging.getLogger("httpx").setLevel(logging.WARNING)
         logging.getLogger("httpcore").setLevel(logging.WARNING)
-        logging.getLogger("google.auth.compute_engine._metadata").setLevel(
-            logging.DEBUG
-        )
-
-        # In _configure_logging or at the top of main_orchestrator.py
-        logging.getLogger("telegram.ext").setLevel(logging.DEBUG)
-        logging.getLogger("telegram.bot").setLevel(logging.DEBUG)
+        # Quieter Google Auth logs unless debugging auth specifically
+        logging.getLogger("google.auth.transport.requests").setLevel(logging.INFO)
+        logging.getLogger("google.auth.compute_engine._metadata").setLevel(logging.INFO)
+        # PTB logs can be noisy on DEBUG, set to INFO or WARNING for normal operation
+        # logging.getLogger("telegram.ext").setLevel(logging.INFO)
+        # logging.getLogger("telegram.bot").setLevel(logging.INFO)
 
     async def _setup_telegram_handlers(self):
         if not config.MIRZA_TELEGRAM_USER_ID or config.MIRZA_TELEGRAM_USER_ID == 0:
@@ -169,10 +148,9 @@ class MiraiOrchestrator:
 
         message_text = update.message.text
         message_dt_utc = update.message.date
-        if message_dt_utc.tzinfo is None:  # Should be aware from PTB
+        if message_dt_utc.tzinfo is None:
             message_dt_utc = message_dt_utc.replace(tzinfo=timezone.utc)
 
-        # Using pytz as per user request to not change this part yet
         current_chat_date = message_dt_utc.astimezone(
             pytz.timezone(config.MIRZA_TIMEZONE)
         ).date()
@@ -180,6 +158,7 @@ class MiraiOrchestrator:
             f"Received message from Mirza (UID: {update.message.from_user.id}): '{message_text[:70]}...'"
         )
 
+        # 1. Log the current user's message
         await self.chat_log_mgr.append_to_daily_chat(
             chat_date=current_chat_date,
             speaker="Mirza",
@@ -187,18 +166,51 @@ class MiraiOrchestrator:
             message_dt_utc=message_dt_utc,
         )
 
-        current_chat_type = "Day Chat"  # Current simplification
-        system_instruction = await self.prompt_builder.build_system_instruction(
-            current_chat_type
+        # 2. Fetch the entire day's chat history, which now includes the message just logged.
+        # This list will be in chronological order.
+        llm_conversation_history: List[Content] = (
+            await self.chat_log_mgr.get_daily_chat_history_as_contents(
+                current_chat_date
+            )
         )
 
-        llm_conversation_history: List[Content] = [
-            Content(role="user", parts=[Part.from_text(text=message_text)])
-        ]
+        # Safety net: if parsing failed or file was empty before this message,
+        # ensure the current message is at least present in the history.
+        # This situation implies the log file was empty or unparseable before this message.
+        if (
+            not llm_conversation_history and message_text
+        ):  # If history is empty but we have a message
+            logger.warning(
+                f"Chat history for {current_chat_date} was empty after parsing. Initializing history with current user message."
+            )
+            llm_conversation_history = [
+                Content(role="user", parts=[Part.from_text(text=message_text)])
+            ]
+        elif (
+            not message_text and not llm_conversation_history
+        ):  # If message is empty and history is empty
+            logger.warning(
+                f"Received empty message text and no prior chat history for {current_chat_date}. LLM history will be empty."
+            )
+            llm_conversation_history = []
 
-        for turn_count in range(
-            config.LLM_MAX_FUNCTION_CALL_TURNS
-        ):  # Assumes LLM_MAX_FUNCTION_CALL_TURNS in config
+        logger.debug(
+            f"LLM conversation history initialized with {len(llm_conversation_history)} messages from chat log for {current_chat_date}."
+        )
+        if llm_conversation_history:
+            # Log the last message for verification
+            last_msg_in_hist = llm_conversation_history[-1]
+            logger.debug(
+                f"Last message in history: role='{last_msg_in_hist.role}', text='{last_msg_in_hist.parts[0].text[:70]}...'"
+            )
+
+        current_chat_type = "Day Chat"
+        system_instruction = await self.prompt_builder.build_system_instruction(
+            current_chat_type=current_chat_type,
+            current_chat_date_for_history=current_chat_date,  # Pass the date here
+        )
+
+        for turn_count in range(config.LLM_MAX_FUNCTION_CALL_TURNS):
             logger.debug(f"LLM Interaction Turn: {turn_count + 1} for Mirza's message.")
 
             text_response, function_calls, error_msg = (
@@ -213,54 +225,81 @@ class MiraiOrchestrator:
                 await self.comm_mgr.send_text_message(
                     f"MIRAI encountered an LLM error: {error_msg}"
                 )
-                return  # Exit this handler on LLM error
+                return
 
             if function_calls:
                 logger.info(
                     f"LLM requested function call(s): {[fc.name for fc in function_calls]}"
                 )
-                fc_parts_for_history = [
-                    Part.from_function_call(name=fc.name, args=fc.args)
-                    for fc in function_calls
-                ]
+                # Add the model's request for function calls to history
                 llm_conversation_history.append(
-                    Content(role="model", parts=fc_parts_for_history)
+                    Content(
+                        role="model",
+                        parts=[
+                            Part.from_function_call(name=fc.name, args=fc.args)
+                            for fc in function_calls
+                        ],
+                    )
                 )
 
                 function_response_parts_for_history = []
-                for fc in function_calls:
-                    args_str = json.dumps(
-                        dict(fc.args)
-                    )  # fc.args is a Struct, convert to dict
+                all_fc_successful = True
+
+                for fc_item in function_calls:
+                    args_str = json.dumps(dict(fc_item.args))
                     await self.chat_log_mgr.append_to_daily_chat(
                         chat_date=current_chat_date,
                         speaker="MIRAI",
-                        message=f"[Function Call Request: {fc.name}({args_str})]",
-                        message_dt_utc=utils.get_current_datetime_utc(),  # Log with current UTC
+                        message=f"[Function Call Request: {fc_item.name}({args_str})]",
+                        message_dt_utc=utils.get_current_datetime_utc(),
                     )
-                    # USE THE INSTANCE HERE
                     response_part_from_handler = (
-                        await self.function_handler_instance.dispatch_function_call(fc)
+                        await self.function_handler_instance.dispatch_function_call(
+                            fc_item
+                        )
                     )
                     function_response_parts_for_history.append(
                         response_part_from_handler
                     )
 
-                    # Log the function response (or error from it)
-                    func_resp_content = str(
+                    func_resp_content_dict = (
                         response_part_from_handler.function_response.response
                     )
+                    func_resp_content_str = json.dumps(
+                        dict(func_resp_content_dict), default=str
+                    )
+
                     await self.chat_log_mgr.append_to_daily_chat(
                         chat_date=current_chat_date,
                         speaker="MIRAI",
-                        message=f"[Function Call Result: {fc.name} -> {func_resp_content[:200]}]",  # Log snippet
+                        message=f"[Function Call Result: {fc_item.name} -> {func_resp_content_str[:200]}]",
                         message_dt_utc=utils.get_current_datetime_utc(),
                     )
+                    if "error" in func_resp_content_dict:
+                        all_fc_successful = False
+                        logger.warning(
+                            f"Function call {fc_item.name} reported an error: {func_resp_content_dict['error']}"
+                        )
+
                 llm_conversation_history.append(
                     Content(role="function", parts=function_response_parts_for_history)
                 )
 
-            elif text_response:
+                # If the LLM's action was *only* to send messages and all were successful, end interaction.
+                is_only_message_sending_actions = all(
+                    fc.name in ["send_text_message_to_mirza", "send_alert_to_mirza"]
+                    for fc in function_calls
+                )
+
+                if is_only_message_sending_actions and all_fc_successful:
+                    logger.info(
+                        "LLM's primary action was to send message(s). Ending interaction for this user input."
+                    )
+                    return  # Exit _handle_mirza_message
+
+                # Otherwise, continue the loop for the LLM to process function results
+
+            elif text_response:  # No function calls, but there is a text response
                 logger.info(
                     f"LLM final text response to Mirza: '{text_response[:70]}...'"
                 )
@@ -271,16 +310,15 @@ class MiraiOrchestrator:
                     message=text_response,
                     message_dt_utc=utils.get_current_datetime_utc(),
                 )
-                return  # End of successful interaction
+                return
 
-            else:  # No text response and no function calls
+            else:
                 logger.warning("LLM returned no actionable output for Mirza's message.")
                 await self.comm_mgr.send_text_message(
                     "MIRAI processed your request but had no specific action or textual response."
                 )
-                return  # End of interaction
+                return
 
-        # This part is reached if the loop completes without returning (max turns exceeded)
         logger.warning(
             f"LLM interaction for Mirza's message exceeded max turns ({config.LLM_MAX_FUNCTION_CALL_TURNS})."
         )
@@ -301,7 +339,7 @@ class MiraiOrchestrator:
     ) -> None:
         logger.info(f"System Event for LLM: {system_event_description[:100]}...")
         system_instruction = await self.prompt_builder.build_system_instruction(
-            "Day Chat"  # Assuming system events also use "Day Chat" context for now
+            "Day Chat"
         )
 
         llm_history = [
@@ -319,7 +357,7 @@ class MiraiOrchestrator:
                 logger.error(
                     f"LLM error during system event '{system_event_description[:50]}...': {err_res}"
                 )
-                break  # Stop processing this event on LLM error
+                break
 
             if fc_res:
                 logger.info(
@@ -336,33 +374,46 @@ class MiraiOrchestrator:
                 )
 
                 fc_responses_for_history = []
+                all_fc_successful = True
                 for fc_item in fc_res:
-                    args_str = json.dumps(
-                        dict(fc_item.args)
-                    )  # fc_item.args is a Struct
+                    args_str = json.dumps(dict(fc_item.args))
                     await self.chat_log_mgr.append_to_daily_chat(
                         current_date_for_log,
                         "MIRAI",
                         f"[System Task Function Call: {fc_item.name}({args_str})]",
                         utils.get_current_datetime_utc(),
                     )
-                    # USE THE INSTANCE HERE
                     response_part = (
                         await self.function_handler_instance.dispatch_function_call(
                             fc_item
                         )
                     )
                     fc_responses_for_history.append(response_part)
-                    func_resp_content = str(response_part.function_response.response)
+
+                    func_resp_content_dict = response_part.function_response.response
+                    func_resp_content_str = json.dumps(dict(func_resp_content_dict))
                     await self.chat_log_mgr.append_to_daily_chat(
                         current_date_for_log,
                         "MIRAI",
-                        f"[System Task Function Result: {fc_item.name} -> {func_resp_content[:100]}]",
+                        f"[System Task Function Result: {fc_item.name} -> {func_resp_content_str[:100]}]",
                         utils.get_current_datetime_utc(),
                     )
+                    if "error" in func_resp_content_dict:
+                        all_fc_successful = False
+
                 llm_history.append(
                     Content(role="function", parts=fc_responses_for_history)
                 )
+
+                is_only_message_sending_actions = all(
+                    f.name in ["send_text_message_to_mirza", "send_alert_to_mirza"]
+                    for f in fc_res
+                )
+                if is_only_message_sending_actions and all_fc_successful:
+                    logger.info(
+                        "System event LLM's action was to send message(s). Ending interaction."
+                    )
+                    break
 
             elif text_res:
                 logger.info(
@@ -374,14 +425,13 @@ class MiraiOrchestrator:
                     f"[System Event LLM Response: {text_res}]",
                     utils.get_current_datetime_utc(),
                 )
-                break  # Successful text response, end interaction
-
-            else:  # No text response and no function calls
+                break
+            else:
                 logger.warning(
                     f"LLM no output for system event '{system_event_description[:50]}...'."
                 )
-                break  # End interaction
-        else:  # Loop completed without break (max turns exceeded)
+                break
+        else:
             logger.warning(
                 f"Max turns reached for system event '{system_event_description[:50]}...'."
             )
@@ -404,7 +454,6 @@ class MiraiOrchestrator:
                     logger.info(
                         f"Processing triggered reminder: {notification['reminder_id']} - {notification['reminder_description']}"
                     )
-
                     system_event_desc = (
                         f"[!SYSTEM!] A reminder is due: '{notification['reminder_description']}'. "
                         f"Due time (UTC): {notification['notify_at_utc_str']}. "
@@ -421,16 +470,15 @@ class MiraiOrchestrator:
                     )
             except Exception as e:
                 logger.exception("Error in _task_reminder_checks.")
-
             try:
                 await asyncio.wait_for(
                     self.stop_event.wait(),
                     timeout=config.REMINDER_CHECK_INTERVAL_SECONDS,
-                )  # Assumes in config
+                )
                 if self.stop_event.is_set():
-                    break  # Exit if stop event is set during wait
+                    break
             except asyncio.TimeoutError:
-                continue  # Timeout means it's time for the next check
+                continue
         logger.info("Reminder check task stopped.")
 
     async def _task_end_of_day_logging(self) -> None:
@@ -439,20 +487,17 @@ class MiraiOrchestrator:
             try:
                 now_local = utils.get_current_datetime_local()
                 current_local_date_for_log = now_local.date()
-
-                # Assumes END_OF_DAY_HOUR and END_OF_DAY_MINUTE in config
                 if (
                     now_local.hour == config.END_OF_DAY_HOUR
                     and now_local.minute == config.END_OF_DAY_MINUTE
                 ):
                     logger.info("Initiating end-of-day log generation.")
-                    log_generation_date = now_local.date()  # Log for "today"
+                    log_generation_date = now_local.date()
                     todays_chat_for_log = (
                         await self.chat_log_mgr.get_daily_chat_content(
                             log_generation_date
                         )
                     )
-
                     if not todays_chat_for_log.strip():
                         logger.info(
                             f"No chat content for {log_generation_date.isoformat()} to generate log from."
@@ -467,17 +512,11 @@ class MiraiOrchestrator:
                         await self._run_single_llm_interaction_for_system(
                             system_event_desc, current_local_date_for_log
                         )
-
-                    await asyncio.sleep(
-                        61
-                    )  # Sleep past the minute to avoid re-triggering
-                    continue  # Go to the start of the loop to check stop_event and then sleep for interval
-
+                    await asyncio.sleep(61)
+                    continue
             except Exception as e:
                 logger.exception("Error in _task_end_of_day_logging.")
-
             try:
-                # Assumes END_OF_DAY_CHECK_INTERVAL_SECONDS in config
                 await asyncio.wait_for(
                     self.stop_event.wait(),
                     timeout=config.END_OF_DAY_CHECK_INTERVAL_SECONDS,
@@ -492,35 +531,65 @@ class MiraiOrchestrator:
         logger.info("Periodic LLM prompt task started.")
         while not self.stop_event.is_set():
             try:
-                # Assumes PERIODIC_LLM_PROMPT_INTERVAL_SECONDS in config
+                # Wait for stop_event or timeout
                 await asyncio.wait_for(
                     self.stop_event.wait(),
                     timeout=config.PERIODIC_LLM_PROMPT_INTERVAL_SECONDS,
                 )
-                if self.stop_event.is_set():
+                # If wait_for completed without TimeoutError, stop_event was set.
+                logger.info(
+                    "Periodic LLM prompt task: stop_event set during wait. Exiting."
+                )
+                break
+
+            except asyncio.TimeoutError:
+                # Interval elapsed. Time to do the work.
+                if (
+                    self.stop_event.is_set()
+                ):  # Check again in case it was set concurrently
+                    logger.info(
+                        "Periodic LLM prompt task: stop_event set just after timeout. Exiting."
+                    )
                     break
 
                 logger.info("Initiating periodic LLM proactive check.")
-                current_local_dt_for_log = utils.get_current_datetime_local()
-                current_local_date_for_log = current_local_dt_for_log.date()
-                current_time_str = utils.format_datetime_for_llm(
-                    current_local_dt_for_log
-                )
+                try:
+                    current_local_dt_for_log = utils.get_current_datetime_local()
+                    current_local_date_for_log = current_local_dt_for_log.date()
+                    current_time_str = utils.format_datetime_for_llm(
+                        current_local_dt_for_log
+                    )
+                    system_event_desc = (
+                        f"[!SYSTEM!] This is a periodic proactive check-in. Current time is {current_time_str}. "
+                        f"Review current active tasks, today's/tomorrow's schedule, and Mirza's habits. "
+                        f"Are there any proactive actions, reminders, or suggestions you should make? "
+                        f"Use appropriate tools to communicate if needed."
+                    )
+                    await self._run_single_llm_interaction_for_system(
+                        system_event_desc, current_local_date_for_log
+                    )
+                except asyncio.CancelledError:
+                    logger.info("Periodic LLM prompt task: Action cancelled.")
+                    # Propagate to outer CancelledError handler to stop the task
+                    raise
+                except Exception as e_action:
+                    logger.exception(
+                        "Error during periodic LLM proactive check action."
+                    )
+                    # Action failed, but the task loop continues for the next interval.
 
-                system_event_desc = (
-                    f"[!SYSTEM!] This is a periodic proactive check-in. Current time is {current_time_str}. "
-                    f"Review current active tasks, today's/tomorrow's schedule, and Mirza's habits. "
-                    f"Are there any proactive actions, reminders, or suggestions you should make? "
-                    f"Use appropriate tools to communicate if needed."
-                )
-                await self._run_single_llm_interaction_for_system(
-                    system_event_desc, current_local_date_for_log
-                )
+            except asyncio.CancelledError:
+                logger.info("Periodic LLM prompt task cancelled (likely during wait).")
+                break  # Exit the while loop
 
-            except Exception as e:
-                logger.exception("Error in _task_periodic_llm_prompts.")
-                # If an error occurs, we still wait for the next interval
-                # The wait_for at the beginning of the loop handles this.
+            except (
+                Exception
+            ) as e_wait:  # Catch other unexpected errors from wait_for itself
+                logger.exception(
+                    f"Unexpected error in periodic LLM prompt task's wait logic: {e_wait}"
+                )
+                break  # Exit the while loop to be safe
+
         logger.info("Periodic LLM prompt task stopped.")
 
     async def start_periodic_tasks(self):
@@ -532,15 +601,19 @@ class MiraiOrchestrator:
             or not hasattr(config, "END_OF_DAY_CHECK_INTERVAL_SECONDS")
             or not hasattr(config, "PERIODIC_LLM_PROMPT_INTERVAL_SECONDS")
         ):
-            logger.error(
-                "One or more periodic task interval/time configurations are missing. Cannot start periodic tasks."
-            )
+            logger.error("Periodic task configurations missing. Cannot start.")
             return
 
-        self.periodic_tasks.append(asyncio.create_task(self._task_reminder_checks()))
-        self.periodic_tasks.append(asyncio.create_task(self._task_end_of_day_logging()))
         self.periodic_tasks.append(
-            asyncio.create_task(self._task_periodic_llm_prompts())
+            asyncio.create_task(self._task_reminder_checks(), name="ReminderChecks")
+        )
+        self.periodic_tasks.append(
+            asyncio.create_task(self._task_end_of_day_logging(), name="EndOfDayLogging")
+        )
+        self.periodic_tasks.append(
+            asyncio.create_task(
+                self._task_periodic_llm_prompts(), name="PeriodicLLMPrompts"
+            )
         )
         logger.info(f"{len(self.periodic_tasks)} periodic tasks scheduled.")
 
@@ -549,133 +622,83 @@ class MiraiOrchestrator:
         for task in self.periodic_tasks:
             if task and not task.done():
                 task.cancel()
-
-        # Wait for all tasks to actually finish or be cancelled
-        # return_exceptions=True ensures that if a task raised an exception (other than CancelledError),
-        # it doesn't stop the gather.
         results = await asyncio.gather(*self.periodic_tasks, return_exceptions=True)
-
         for i, result in enumerate(results):
-            task_name = (
-                self.periodic_tasks[i].get_name()
-                if hasattr(self.periodic_tasks[i], "get_name")
-                else f"Task {i}"
-            )
+            task_name = self.periodic_tasks[i].get_name()
             if isinstance(result, asyncio.CancelledError):
                 logger.info(f"Periodic task '{task_name}' cancelled successfully.")
             elif isinstance(result, Exception):
                 logger.error(
-                    f"Error during cancellation/shutdown of periodic task '{task_name}': {result}"
+                    f"Error during cancellation/shutdown of task '{task_name}': {result}"
                 )
-
         self.periodic_tasks.clear()
         logger.info("Periodic tasks stopped and cleared.")
 
     async def run(self):
-        await self._setup_telegram_handlers()  # Setup handlers before starting tasks or polling
+        await self._setup_telegram_handlers()
         await self.start_periodic_tasks()
-
         logger.info("Starting Telegram bot components...")
         try:
             if not self.ptb_application:
                 logger.error("PTB Application not initialized. Cannot run.")
                 return
-
             await self.ptb_application.initialize()
             logger.info("PTB Application initialized.")
-
             if not self.ptb_application.updater:
-                logger.error(
-                    "PTB Updater not available after initialize. Cannot start polling."
-                )
+                logger.error("PTB Updater not available. Cannot start polling.")
                 return
-
             await self.ptb_application.updater.start_polling(
-                allowed_updates=Update.ALL_TYPES,
-                drop_pending_updates=True,  # Good for production
-                # stop_signals are not handled by updater.start_polling directly
+                allowed_updates=Update.ALL_TYPES, drop_pending_updates=True
             )
             logger.info("PTB Updater started polling.")
-
             await self.ptb_application.start()
             logger.info("PTB Application started processing updates.")
-
-            # Keep the run method alive until stop_event is set
             await self.stop_event.wait()
             logger.info(
                 "Stop event received, MiraiOrchestrator.run proceeding to shutdown."
             )
-
         except Exception as e:
-            logger.critical(
-                f"Error in MiraiOrchestrator.run main try block: {e}", exc_info=True
-            )
+            logger.critical(f"Error in MiraiOrchestrator.run: {e}", exc_info=True)
         finally:
             logger.info("MiraiOrchestrator.run finally block reached.")
-            # Ensure shutdown is called, stop_event might have been set by a signal or error
-            # The shutdown_orchestrator method is idempotent.
             await self.shutdown_orchestrator()
 
     async def shutdown_orchestrator(self):
         logger.info("Initiating MIRAI Orchestrator shutdown sequence...")
-        if (
-            self.stop_event.is_set()
-            and hasattr(self, "_shutdown_called_flag")
-            and self._shutdown_called_flag
-        ):
-            logger.info("Shutdown already effectively in progress or completed.")
+        if self.stop_event.is_set() and self._shutdown_called_flag:
+            logger.info("Shutdown already in progress or completed.")
             return
-
         self.stop_event.set()
-        self._shutdown_called_flag = (
-            True  # To prevent re-entry issues if called rapidly
-        )
+        self._shutdown_called_flag = True
 
-        # Stop PTB components
         if (
             hasattr(self.ptb_application, "updater")
             and self.ptb_application.updater
             and self.ptb_application.updater.running
         ):
             logger.info("Stopping PTB Updater...")
-            try:
-                await self.ptb_application.updater.stop()
-            except Exception as e:
-                logger.error(f"Error stopping PTB Updater: {e}", exc_info=True)
-
+            await self.ptb_application.updater.stop()
         if hasattr(self.ptb_application, "running") and self.ptb_application.running:
             logger.info("Stopping PTB Application...")
-            try:
-                await self.ptb_application.stop()
-            except Exception as e:
-                logger.error(f"Error stopping PTB Application: {e}", exc_info=True)
-
+            await self.ptb_application.stop()
         await self.stop_periodic_tasks()
-
         if hasattr(self.ptb_application, "shutdown"):
             logger.info("Shutting down PTB Application resources...")
-            try:
-                await self.ptb_application.shutdown()
-            except Exception as e:
-                logger.error(f"Error shutting down PTB Application: {e}", exc_info=True)
-
+            await self.ptb_application.shutdown()
         logger.info("MIRAI Orchestrator shutdown complete.")
 
 
-async def main_orchestrator_entry():  # Renamed to avoid conflict if imported
-    # Ensure necessary directories exist (config.py should ideally handle this on import or first access)
+async def main_orchestrator_entry():
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
     config.LOGS_DIR.mkdir(parents=True, exist_ok=True)
     config.CHATS_DIR.mkdir(parents=True, exist_ok=True)
-    # Add other directories like config.TASKS_FILE.parent.mkdir(parents=True, exist_ok=True) if needed
-
     orchestrator = None
     try:
         orchestrator = MiraiOrchestrator()
-    except RuntimeError as e:  # Catch initialization errors (e.g., GeminiClient failed)
+    except RuntimeError as e:
         logger.critical(f"Failed to initialize MiraiOrchestrator: {e}")
-        return  # Exit if orchestrator can't be created
-    except Exception as e:  # Catch any other unexpected init error
+        return
+    except Exception as e:
         logger.critical(
             f"Unexpected error during MiraiOrchestrator initialization: {e}",
             exc_info=True,
@@ -691,41 +714,30 @@ async def main_orchestrator_entry():  # Renamed to avoid conflict if imported
                     handle_shutdown_signal(s, orchestrator)
                 ),
             )
-        except NotImplementedError:  # pragma: no cover
+        except (NotImplementedError, RuntimeError) as e:
             logger.warning(
-                f"Signal handling for {sig_name} not supported on this platform. Manual stop (Ctrl+C) might be abrupt."
-            )
-        except RuntimeError as e:  # pragma: no cover
-            logger.warning(
-                f"Could not set signal handler for {sig_name} (perhaps not in main thread?): {e}"
+                f"Signal handling for {sig_name} not fully supported or failed: {e}"
             )
 
     try:
         await orchestrator.run()
-    except Exception as e:  # pragma: no cover
+    except Exception as e:
         logger.critical(f"Critical error in orchestrator run: {e}", exc_info=True)
     finally:
         logger.info("Orchestrator run loop exited or was interrupted.")
-        if orchestrator and not orchestrator.stop_event.is_set():  # pragma: no cover
-            # This ensures shutdown is called if orchestrator.run() exits cleanly
-            # without a signal (e.g. if run_polling was to ever return None without error
-            # and without stop_event being set - though unlikely with close_loop=False)
+        if orchestrator and not orchestrator.stop_event.is_set():
             logger.info(
-                "Ensuring orchestrator shutdown is called from main_orchestrator_entry finally block..."
+                "Ensuring orchestrator shutdown from main_orchestrator_entry finally block..."
             )
             await orchestrator.shutdown_orchestrator()
 
 
 async def handle_shutdown_signal(signal_name: str, orchestrator: MiraiOrchestrator):
     logger.info(f"Received signal {signal_name}. Initiating graceful shutdown...")
-    if not orchestrator.stop_event.is_set():
+    if (
+        orchestrator and not orchestrator.stop_event.is_set()
+    ):  # Check orchestrator existence
         await orchestrator.shutdown_orchestrator()
-
-    # After orchestrator shutdown, we might want to cancel any other lingering tasks
-    # and stop the event loop if this is the main entry point.
-    # This part is tricky as run_polling might still be blocking.
-    # The shutdown_orchestrator should handle stopping run_polling.
-    # If run_polling has truly stopped, the loop might exit naturally.
 
 
 if __name__ == "__main__":
