@@ -350,7 +350,82 @@ TOOL_DECLARATIONS = [
         ),
     ),
     # get_reminder, update_reminder, delete_reminder, query_reminders can be added similarly if LLM needs to manage them directly.
-    # For now, system handles triggering, LLM reacts.
+    genai_types.FunctionDeclaration(
+        name="get_reminder",
+        description="Retrieves a specific reminder by its ID.",
+        parameters=genai_types.Schema(
+            type=genai_types.Type.OBJECT,
+            properties={
+                "reminder_id": _string_param_schema(
+                    "The ID of the reminder to retrieve."
+                ),
+            },
+            required=["reminder_id"],
+        ),
+    ),
+    genai_types.FunctionDeclaration(
+        name="update_reminder",
+        description="Updates an existing reminder. Provide only the fields to be changed. Dates/times should be in Mirza's local timezone.",
+        parameters=genai_types.Schema(
+            type=genai_types.Type.OBJECT,
+            properties={
+                "reminder_id": _string_param_schema(
+                    "The ID of the reminder to update."
+                ),
+                "description": _string_param_schema(
+                    "Optional. New description for the reminder."
+                ),
+                "due_datetime_str": _string_param_schema(
+                    "Optional. New due date/time string for the reminder."
+                ),
+                "notify_before_list": _array_string_param_schema(
+                    "Optional. New list of durations for pre-notifications (e.g., ['5m', '1h']). Set to empty list to remove pre-notifications."
+                ),
+                "status": _string_param_schema(
+                    "Optional. New status for the reminder (e.g., 'pending', 'active', 'completed', 'dismissed')."
+                ),
+                "related_item_id": _string_param_schema(
+                    "Optional. New ID of a related task, note, or event. Set to null/empty to remove."
+                ),
+                "action_on_trigger": _string_param_schema(
+                    "Optional. New action to take when reminder triggers."
+                ),
+            },
+            required=["reminder_id"],
+        ),
+    ),
+    genai_types.FunctionDeclaration(
+        name="delete_reminder",
+        description="Deletes a reminder by its ID.",
+        parameters=genai_types.Schema(
+            type=genai_types.Type.OBJECT,
+            properties={
+                "reminder_id": _string_param_schema(
+                    "The ID of the reminder to delete."
+                ),
+            },
+            required=["reminder_id"],
+        ),
+    ),
+    genai_types.FunctionDeclaration(
+        name="query_reminders",
+        description="Queries reminders based on criteria like status or due date range. Dates/times should be in Mirza's local timezone.",
+        parameters=genai_types.Schema(
+            type=genai_types.Type.OBJECT,
+            properties={
+                "status": _string_param_schema(
+                    "Optional. Filter reminders by status (e.g., 'pending', 'active', 'completed', 'dismissed')."
+                ),
+                "due_before_str": _string_param_schema(
+                    "Optional. Filter reminders due before this date/time string."
+                ),
+                "due_after_str": _string_param_schema(
+                    "Optional. Filter reminders due after this date/time string."
+                ),
+            },
+            required=[],  # All parameters are optional
+        ),
+    ),
     # --- HabitsManager Functions ---
     genai_types.FunctionDeclaration(
         name="get_habits_content",
