@@ -110,7 +110,13 @@ class PromptBuilder:
         summary = event.get("summary", "No Summary")
         location = f", Location: {event['location']}" if event.get("location") else ""
         all_day_str = " (All-day)" if event.get("all_day") else ""
-        return f"- {summary}{all_day_str}: From {start_str} to {end_str}{location} (UID: {event.get('uid', 'N/A')}), Description: {event.get('description', 'No Description')[:150]}..."
+        description = event.get("description", "")
+        if description and len(description) > 150:
+            description = description[:150] + "..."
+        elif not description:
+            description = "No Description"
+
+        return f"- {summary}{all_day_str}: From {start_str} to {end_str}{location} (UID: {event.get('uid', 'N/A')}), Description: {description}"
 
     def _format_reminder_item(self, reminder: Dict[str, Any]) -> str:
         due_dt_utc_str = reminder.get("due_datetime_utc")
@@ -150,16 +156,10 @@ class PromptBuilder:
             formatted_items = [item_formatter_func(item) for item in items]
         return "\n".join(formatted_items) if formatted_items else empty_message
 
-    # def _format_external_abilities(self) -> str:
-    #     if not ALL_TOOLS:
-    #         return "No external abilities (tools) are currently defined."
-    #     abilities_list = []
-    #     for tool in ALL_TOOLS:
-    #         abilities_list.append(f"- {tool.name}: {tool.description}")
-    #     return "\n".join(abilities_list)
-
     async def build_system_instruction(
-        self, current_chat_type: Literal["Day Chat", "Chat Instance"]
+        self,
+        current_chat_type: Literal["Day Chat", "Chat Instance"],
+        current_chat_date_for_history: Optional[date] = None,  # New parameter
     ) -> str:
         """
         Builds the complete system instruction string for the LLM.
@@ -174,7 +174,6 @@ class PromptBuilder:
         # --- Static & Simple Dynamic Data ---
         try:
             placeholders["{{ABOUT_MIRZA}}"] = (
-                # self.about_mirza_mgr.get_about_mirza_content()
                 config.ABOUT_MIRZA_FILE.read_text(encoding="utf-8")
                 or "No 'About Mirza' content available."
             )
@@ -192,11 +191,13 @@ class PromptBuilder:
             logger.error(f"Error fetching habits content: {e}")
             placeholders["{{MIRZAS_HABITS}}"] = "Error fetching habits content."
 
-        placeholders["{{EXTERNAL_ABILITIES}}"] = "None yet."
+        placeholders["{{EXTERNAL_ABILITIES}}"] = (
+            "None yet."  # This was for future tools
+        )
         placeholders["{{CURRENT_DATETIME}}"] = utils.format_datetime_for_llm(
             current_local_dt
         )
-        placeholders["{{LOCATION}}"] = utils.get_mirza_location()  # Assumed synchronous
+        placeholders["{{LOCATION}}"] = utils.get_mirza_location()
 
         # --- Data from Managers (potentially async) ---
         try:
@@ -208,7 +209,6 @@ class PromptBuilder:
             )
         except Exception as e:
             logger.error(f"Error fetching today's schedule: {e}")
-            logger.error(f"Stack trace: {e.__traceback__}")
             placeholders["{{TODAYS_SCHEDULE}}"] = "Error fetching today's schedule."
 
         try:
@@ -225,9 +225,7 @@ class PromptBuilder:
             )
 
         try:
-            active_notes_items = (
-                self.notes_mgr.get_active_notes()
-            )  # Assumed synchronous
+            active_notes_items = self.notes_mgr.get_active_notes()
             placeholders["{{ACTIVE_NOTES}}"] = self._format_list_data(
                 active_notes_items, self._format_note_item, "No active notes."
             )
@@ -254,9 +252,7 @@ class PromptBuilder:
             placeholders["{{TODAYS_LOG}}"] = "Error fetching today's log."
 
         try:
-            active_tasks_items = (
-                self.tasks_mgr.get_active_tasks()
-            )  # Assumed synchronous
+            active_tasks_items = self.tasks_mgr.get_active_tasks()
             placeholders["{{ACTIVE_TASKS}}"] = self._format_list_data(
                 active_tasks_items, self._format_task_item, "No active tasks."
             )
@@ -265,7 +261,6 @@ class PromptBuilder:
             placeholders["{{ACTIVE_TASKS}}"] = "Error fetching active tasks."
 
         try:
-            # Combine pending and active reminders for the prompt
             pending_reminders = self.reminders_mgr.query_reminders(status="pending")
             active_reminders_status = self.reminders_mgr.query_reminders(
                 status="active"
@@ -273,7 +268,6 @@ class PromptBuilder:
             all_active_reminders = (pending_reminders or []) + (
                 active_reminders_status or []
             )
-            # Sort them by due date for consistent display
             all_active_reminders.sort(key=lambda r: r.get("due_datetime_utc") or "")
 
             placeholders["{{ACTIVE_REMINDERS}}"] = self._format_list_data(
@@ -284,26 +278,19 @@ class PromptBuilder:
             placeholders["{{ACTIVE_REMINDERS}}"] = "Error fetching active reminders."
 
         # Chat context placeholders
-        try:
-            chat_instance_refs = self.chat_log_mgr.get_chat_instance_references_for_day(
-                today_date
-            )
-            if chat_instance_refs:
-                placeholders["{{CHAT_INSTANCES}}"] = "\n".join(
-                    [f"- {ref}" for ref in chat_instance_refs]
-                )
-            else:
-                placeholders["{{CHAT_INSTANCES}}"] = "No other chat instances today."
-        except Exception as e:
-            logger.error(f"Error fetching chat instance references: {e}")
-            placeholders["{{CHAT_INSTANCES}}"] = (
-                "Error fetching chat instance references."
-            )
+        # As per user note, chat instances feature is disabled.
+        placeholders["{{CHAT_INSTANCES}}"] = (
+            "Chat instances feature is currently disabled."
+        )
 
-        if current_chat_type == "Chat Instance":
+        if (
+            current_chat_type == "Chat Instance"
+        ):  # This branch will effectively not be used if we always use "Day Chat"
             try:
-                todays_day_chat_content = self.chat_log_mgr.get_daily_chat_content(
-                    today_date
+                # This was intended to fetch the main "Day Chat" if the current_chat_type was an "Instance"
+                # Since instances are disabled, this logic might be simplified or removed if only "Day Chat" is used.
+                todays_day_chat_content = (
+                    await self.chat_log_mgr.get_daily_chat_content(today_date)
                 )
                 if todays_day_chat_content:
                     placeholders["{{TODAYS_CHAT_IF_NOT_DAY_CHAT}}"] = (
@@ -319,16 +306,12 @@ class PromptBuilder:
                     "Error fetching today's Day Chat content."
                 )
         else:  # Current chat is Day Chat
-            placeholders["{{TODAYS_CHAT_IF_NOT_DAY_CHAT}}"] = (
-                ""  # Or "N/A (This is the Day Chat)"
-            )
+            placeholders["{{TODAYS_CHAT_IF_NOT_DAY_CHAT}}"] = ""
 
-        # Substitute all placeholders
         prompt_string = self.system_prompt_template
         for placeholder, value in placeholders.items():
             prompt_string = prompt_string.replace(placeholder, str(value))
 
-        # Check for any missed placeholders (should not happen if all are covered)
         if "{{" in prompt_string and "}}" in prompt_string:
             logger.warning(
                 f"Unfilled placeholders might remain in the system prompt: {prompt_string[:500]}..."
@@ -340,26 +323,21 @@ class PromptBuilder:
 if __name__ == "__main__":
     import asyncio
 
-    # --- Setup for Standalone Testing ---
     logging.basicConfig(
         level=logging.DEBUG,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
 
-    # Create dummy data files and directories if they don't exist for testing
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
     config.LOGS_DIR.mkdir(parents=True, exist_ok=True)
     config.CHATS_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Dummy system_prompt.md
     dummy_system_prompt_content = """
 System Prompt for MIRAI
 About Mirza: {{ABOUT_MIRZA}}
 Current Chat Type: {{CHAT_TYPE}}
-Today's Other Chat Instances:
-{{CHAT_INSTANCES}}
-External Abilities:
-{{EXTERNAL_ABILITIES}}
+Today's Other Chat Instances: {{CHAT_INSTANCES}}
+External Abilities: {{EXTERNAL_ABILITIES}}
 Current Date & Time: {{CURRENT_DATETIME}}
 Location: {{LOCATION}}
 Today's Schedule:
@@ -381,7 +359,10 @@ Active Reminders:
 --- Context from Day Chat (if applicable) ---
 {{TODAYS_CHAT_IF_NOT_DAY_CHAT}}
     """
-    if not config.SYSTEM_PROMPT_FILE.exists():
+    if (
+        not config.SYSTEM_PROMPT_FILE.exists()
+        or config.SYSTEM_PROMPT_FILE.read_text().strip() == ""
+    ):
         config.SYSTEM_PROMPT_FILE.write_text(
             dummy_system_prompt_content.strip(), encoding="utf-8"
         )
@@ -395,46 +376,38 @@ Active Reminders:
             "- Meditate daily\n- Exercise 3x a week", encoding="utf-8"
         )
 
-    # Mock ChatLogManager's new method for testing
-    def mock_get_chat_instance_references_for_day(self, chat_date: date) -> List[str]:
-        if chat_date == utils.get_current_datetime_local().date():
-            return [
-                "Instance: 'Test Chat 1' at 10:00 AM",
-                "Instance: 'Another Idea' at 02:30 PM",
-            ]
-        return []
-
-    ChatLogManager.get_chat_instance_references_for_day = mock_get_chat_instance_references_for_day  # type: ignore
-
     async def test_prompt_builder():
-        # Initialize managers (they will create their default files if not present)
         tasks_mgr = TasksManager()
         notes_mgr = NotesManager()
-        calendar_mgr = CalendarManager()  # Will create an empty calendar.ics
+        calendar_mgr = CalendarManager()
         log_mgr = LogManager()
         reminders_mgr = RemindersManager()
         habits_mgr = HabitsManager()
-        # about_mirza_mgr = AboutMirzaManager()
-        chat_log_mgr = ChatLogManager()  # Will create chats dir
+        chat_log_mgr = ChatLogManager()
 
-        # Add some sample data for more realistic prompt
-        tasks_mgr.create_task("Test Task 1", due_date_str="May 19, 2025 10:00 AM")
+        # Add some sample data
+        tasks_mgr.create_task("Test Task 1", due_date_str="tomorrow 10:00 AM")
         notes_mgr.create_note(
             "Test Note 1",
             title="Important Idea",
             expiry_duration_str="2 days",
             tags=["testing"],
         )
+        # Use current date for calendar events to make them appear in "today's schedule"
+        today_str = utils.get_current_datetime_local().strftime("%Y-%m-%d")
         calendar_mgr.create_event(
             "Today's Meeting",
-            start_dt_str="May 18, 2025 10:00 AM",
+            start_dt_str=f"{today_str} 14:00",  # Example: today at 2 PM
             duration_str="1h",
             location="Office",
         )
+        tomorrow_str = (
+            utils.get_current_datetime_local() + timedelta(days=1)
+        ).strftime("%Y-%m-%d")
         calendar_mgr.create_event(
             "Tomorrow's Plan",
-            start_dt_str="May 19, 2025 09:00 AM",
-            end_dt_str="May 19, 2025 05:00 PM",
+            start_dt_str=f"{tomorrow_str} 09:00",
+            end_dt_str=f"{tomorrow_str} 17:00",
             description="Work on MIRAI",
         )
         log_mgr.save_daily_log(
@@ -443,11 +416,11 @@ Active Reminders:
         )
         reminders_mgr.create_reminder(
             "Test Reminder",
-            due_datetime_str="May 18, 2025 06:00 PM",
+            due_datetime_str=f"{today_str} 18:00",  # Example: today at 6 PM
             notify_before_list=["15m"],
         )
 
-        chat_log_mgr.append_to_daily_chat(
+        await chat_log_mgr.append_to_daily_chat(  # Use await here
             utils.get_current_datetime_local().date(),
             "Mirza",
             "This is the main day chat content.",
@@ -460,7 +433,6 @@ Active Reminders:
             log_mgr,
             reminders_mgr,
             habits_mgr,
-            # about_mirza_mgr,
             chat_log_mgr,
         )
 
@@ -469,36 +441,31 @@ Active Reminders:
             current_chat_type="Day Chat"
         )
         print(day_chat_prompt)
-        assert "{{ABOUT_MIRZA}}" not in day_chat_prompt  # Check one placeholder
-        # assert "Mirza is developing MIRAI." in day_chat_prompt
-        assert "This chat is a Day Chat" in day_chat_prompt
+        assert "{{ABOUT_MIRZA}}" not in day_chat_prompt
+        assert "Current Chat Type: Day Chat" in day_chat_prompt
         assert "Test Task 1" in day_chat_prompt
         assert "Today's Meeting" in day_chat_prompt
+        assert "Chat instances feature is currently disabled." in day_chat_prompt
         assert (
-            "No other chat instances today." not in day_chat_prompt
-        )  # Should list them
-        assert "Instance: 'Test Chat 1' at 10:00 AM" in day_chat_prompt
-        assert (
-            "--- Today's Main Day Chat (for context) ---" not in day_chat_prompt
-        )  # Because it IS day chat
+            "--- Today's Main Day Chat (for context) ---"
+            not in day_chat_prompt  # Correct for "Day Chat" type
+        )
 
-        print("\n--- Building System Instruction for 'Chat Instance' ---")
+        # Since "Chat Instance" type is effectively disabled by always using "Day Chat"
+        # the following test might be less relevant, but we can keep it to ensure
+        # the {{TODAYS_CHAT_IF_NOT_DAY_CHAT}} placeholder is handled.
+        print("\n--- Building System Instruction for 'Chat Instance' (Simulated) ---")
+        # For this test to be meaningful, we'd need a way for PromptBuilder to know
+        # it's *not* the day chat, and then it would try to include the day chat.
+        # Given the simplification, this part of the prompt might always be empty or show "N/A".
+        # The current logic in build_system_instruction for TODAYS_CHAT_IF_NOT_DAY_CHAT
+        # will try to load the day chat if current_chat_type is "Chat Instance".
         instance_chat_prompt = await builder.build_system_instruction(
-            current_chat_type="Chat Instance"
+            current_chat_type="Chat Instance"  # This will trigger loading of day chat for the placeholder
         )
         print(instance_chat_prompt)
-        assert "This chat is a Chat Instance" in instance_chat_prompt
-        # assert "--- Today's Main Day Chat (for context) ---" in instance_chat_prompt
-        # assert "This is the main day chat content." in instance_chat_prompt
-
-        # Basic cleanup (optional, as files are small and useful for inspection)
-        # config.SYSTEM_PROMPT_FILE.unlink(missing_ok=True)
-        # config.ABOUT_MIRZA_FILE.unlink(missing_ok=True)
-        # config.HABITS_FILE.unlink(missing_ok=True)
-        # tasks_mgr.tasks_file.unlink(missing_ok=True)
-        # notes_mgr.notes_file.unlink(missing_ok=True)
-        # calendar_mgr.calendar_file.unlink(missing_ok=True)
-        # reminders_mgr.reminders_file.unlink(missing_ok=True)
-        # For logs and chats, might need to remove directories or specific files
+        assert "Current Chat Type: Chat Instance" in instance_chat_prompt
+        assert "--- Today's Main Day Chat (for context) ---" in instance_chat_prompt
+        assert "This is the main day chat content." in instance_chat_prompt
 
     asyncio.run(test_prompt_builder())
